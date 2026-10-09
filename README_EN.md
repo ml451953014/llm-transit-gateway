@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.md)
 
+![LLM Transit Gateway: one gateway connecting multiple model providers to any AI tool](assets/social-preview.png)
+
 [![CI](https://github.com/ml451953014/llm-transit-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/ml451953014/llm-transit-gateway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)

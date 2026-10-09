@@ -1,5 +1,7 @@
 # LLM Transit Gateway
 
+[English](README_EN.md) | **简体中文**
+
 让 Gemini、Vertex AI、Claude、OpenAI 等模型通过统一接口接入常用 AI 工具。
 
 LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户端统一提供 OpenAI 兼容的 `/v1/chat/completions` 与 `/v1/responses` 接口，后端可同时连接 Gemini API、Google Vertex AI、AWS Bedrock、OpenAI、Anthropic 和自定义 OpenAI 兼容线路。

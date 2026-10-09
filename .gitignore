@@ -1,0 +1,11 @@
+.env
+*.yaml
+logs/
+__pycache__/
+.DS_Store
+
+# 敏感凭证文件（API Key / 服务账号）
+providers_config.json
+*.json
+_backup_local_*/
+.gstack/

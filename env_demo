@@ -1,0 +1,7 @@
+GEMINI_API_KEY=xxxxx
+AWS_BEARER_TOKEN_BEDROCK=xxxxx
+AWS_REGION= us-west-2
+# 是否只拉取 Claude 模型（true/false，默认 true）
+BEDROCK_CLAUDE_ONLY=true
+# 日志保留天数，超过此天数的 logs/*.log 会在启动时自动清理（默认 7，设为 0 或负数则不清理）
+LOG_RETENTION_DAYS=7

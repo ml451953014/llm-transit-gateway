@@ -118,6 +118,24 @@ class ProviderManagerRegressionTests(unittest.TestCase):
         self.assertIn("api_base: 'https://example.invalid/api/v3'", rendered)
         self.assertNotIn("/api/v3/v1", rendered)
 
+    def test_deepseek_url_detection_uses_hostname_boundary(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"data": []}'
+        with mock.patch("provider_manager.urllib.request.urlopen", return_value=response) as opened:
+            provider_manager.fetch_openai_compatible_models(
+                "https://deepseek.com.evil.example", "fake-key"
+            )
+        self.assertEqual(
+            opened.call_args.args[0].full_url,
+            "https://deepseek.com.evil.example/v1/models",
+        )
+
+        with mock.patch("provider_manager.urllib.request.urlopen", return_value=response) as opened:
+            provider_manager.fetch_openai_compatible_models(
+                "https://api.deepseek.com", "fake-key"
+            )
+        self.assertEqual(opened.call_args.args[0].full_url, "https://api.deepseek.com/models")
+
     def test_vertex_model_report_keeps_partial_results_and_source_error(self):
         credentials = mock.Mock(token="access-token")
         google_response = mock.MagicMock()
@@ -259,6 +277,69 @@ class ProxyRegressionTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             proxy._require_admin_request(request)
         self.assertEqual(raised.exception.status_code, 403)
+
+    def test_failed_request_filename_does_not_use_model_name(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            old_dir = proxy.FAILED_REQ_DIR
+            proxy.FAILED_REQ_DIR = Path(tmp_dir)
+            try:
+                proxy._save_failed_request(b"{}", "../../secret-model", 400)
+                saved = list(Path(tmp_dir).glob("*.json"))
+                self.assertEqual(len(saved), 1)
+                self.assertNotIn("secret-model", saved[0].name)
+                self.assertEqual(saved[0].parent, Path(tmp_dir))
+            finally:
+                proxy.FAILED_REQ_DIR = old_dir
+
+    def test_public_model_errors_do_not_expose_exception_details(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/models",
+            "headers": [(b"authorization", b"Bearer test")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 4000),
+            "scheme": "http",
+        })
+        with mock.patch("proxy.httpx.AsyncClient", side_effect=RuntimeError("sensitive detail")):
+            response = asyncio.run(proxy.list_models(request))
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(payload["error"]["message"], "内部模型服务暂时不可用")
+        self.assertNotIn("sensitive detail", response.body.decode())
+
+    def test_public_proxy_errors_do_not_expose_exception_details(self):
+        body = json.dumps({
+            "model": "demo/model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }).encode()
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "query_string": b"",
+            "headers": [(b"authorization", b"Bearer test")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 4000),
+            "scheme": "http",
+        }, receive)
+        upstream_error = mock.AsyncMock(side_effect=RuntimeError("sensitive detail"))
+        with mock.patch.object(proxy._http_client, "request", new=upstream_error):
+            response = asyncio.run(proxy.proxy(request, "v1/chat/completions"))
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(payload["error"]["message"], "内部模型服务暂时不可用")
+        self.assertNotIn("sensitive detail", response.body.decode())
 
 
 class UpdateConfigRegressionTests(unittest.IsolatedAsyncioTestCase):

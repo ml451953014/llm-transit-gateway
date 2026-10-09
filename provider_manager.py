@@ -7,6 +7,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("provider_manager")
 
@@ -379,8 +380,10 @@ def fetch_gemini_models_api(api_key: str) -> List[str]:
 
 def fetch_openai_compatible_models(base_url: str, api_key: str) -> List[str]:
     clean_base = base_url.rstrip("/")
+    hostname = (urlsplit(clean_base).hostname or "").lower().rstrip(".")
+    is_deepseek = hostname == "deepseek.com" or hostname.endswith(".deepseek.com")
     if not re.search(r"/(?:api/)?v\d+$", clean_base):
-        if "deepseek.com" in clean_base:
+        if is_deepseek:
             url = f"{clean_base}/models"
         else:
             url = f"{clean_base}/v1/models"

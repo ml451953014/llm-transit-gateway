@@ -165,7 +165,7 @@ FAILED_REQ_DIR = LOG_DIR / "failed_requests"
 _FAILED_REQ_KEEP = 20
 
 
-def _save_failed_request(body: bytes, model_name: str, status: int) -> None:
+def _save_failed_request(body: bytes, _model_name: str, status: int) -> None:
     """上游返回 4xx 时保存网关实际转发出去的请求体，只保留最近 _FAILED_REQ_KEEP 份。
 
     Vertex 的 400 只回一句 "Request contains an invalid argument"，不说是哪个字段，
@@ -173,7 +173,8 @@ def _save_failed_request(body: bytes, model_name: str, status: int) -> None:
     """
     try:
         FAILED_REQ_DIR.mkdir(parents=True, exist_ok=True)
-        name = f"{time.strftime('%Y%m%d_%H%M%S')}_{status}_{re.sub(r'[^A-Za-z0-9._-]', '_', model_name or 'unknown')}.json"
+        # 文件名完全由服务端生成，避免把客户端可控的模型名带入路径。
+        name = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}.json"
         (FAILED_REQ_DIR / name).write_bytes(body)
         for old in sorted(FAILED_REQ_DIR.glob("*.json"))[:-_FAILED_REQ_KEEP]:
             old.unlink(missing_ok=True)
@@ -1134,7 +1135,11 @@ async def list_models(request: Request):
             resp = await client.get(f"http://localhost:{LITELLM_PORT}/v1/models")
         data = resp.json()
     except Exception as e:
-        return JSONResponse({"error": {"message": f"获取模型列表失败: {e}", "type": "proxy_error"}}, status_code=502)
+        print(f"[ERROR] 获取模型列表失败: {type(e).__name__}: {e}")
+        return JSONResponse(
+            {"error": {"message": "内部模型服务暂时不可用", "type": "proxy_error"}},
+            status_code=502,
+        )
 
     for m in data.get("data", []):
         mid = m.get("id", "")
@@ -1289,9 +1294,11 @@ async def proxy(request: Request, path: str):
             return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
 
     except Exception as e:
-        err_msg = f"转发至 LiteLLM 失败: {str(e)}"
-        print(f"[ERROR] {err_msg}")
-        return JSONResponse({"error": {"message": err_msg, "type": "proxy_error"}}, status_code=502)
+        print(f"[ERROR] 转发至 LiteLLM 失败: {type(e).__name__}: {e}")
+        return JSONResponse(
+            {"error": {"message": "内部模型服务暂时不可用", "type": "proxy_error"}},
+            status_code=502,
+        )
 
 
 def kill_port(port: int):

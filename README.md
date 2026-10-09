@@ -2,6 +2,10 @@
 
 [English](README_EN.md) | **简体中文**
 
+[![CI](https://github.com/ml451953014/llm-transit-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/ml451953014/llm-transit-gateway/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)
+
 让 Gemini、Vertex AI、Claude、OpenAI 等模型通过统一接口接入常用 AI 工具。
 
 LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户端统一提供 OpenAI 兼容的 `/v1/chat/completions` 与 `/v1/responses` 接口，后端可同时连接 Gemini API、Google Vertex AI、AWS Bedrock、OpenAI、Anthropic 和自定义 OpenAI 兼容线路。
@@ -121,6 +125,20 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
 - API Key：任意非空 Bearer 字符串（网关只检查非空，鉴权交由上游厂商凭证）
 - Model：优先使用 `厂商id/模型名`（如 `vertex_google/gemini-2.5-pro`）。裸模型名只在全局唯一时自动提供；同一模型存在于多个实例时，必须在控制台显式指定默认实例，否则不会注册该裸名，避免请求误入错误项目。
 
+## 开源生态与兼容客户端
+
+本项目使用 [LiteLLM](https://github.com/BerriAI/litellm) 作为上游厂商路由层，并提供标准的模型列表、Chat Completions 与 Responses 接口。支持自定义 OpenAI Base URL 的开源客户端通常可以直接接入：
+
+| 开源项目 | 接入方式 |
+|---|---|
+| [CC Switch](https://github.com/farion1231/cc-switch) | 把网关作为自定义供应商，统一配置 Claude Code、Codex、Gemini CLI 等工具 |
+| [Open WebUI](https://github.com/open-webui/open-webui) | 添加 OpenAI-compatible 连接，Base URL 使用 `http://localhost:4000/v1` |
+| [Cline](https://github.com/cline/cline) | 选择 **OpenAI Compatible**，填写 Base URL、任意非空 API Key 和模型 ID |
+| [Continue](https://github.com/continuedev/continue) | 使用 `openai` provider，并把 `apiBase` 指向本项目 |
+| [Cherry Studio](https://github.com/CherryHQ/cherry-studio) | 添加自定义 OpenAI 兼容供应商并填写网关地址 |
+
+这里的“兼容”指模型发现与文本/工具调用接口；本项目目前不提供 embeddings、语音或图像生成接口。不同客户端会发送不同扩展字段，遇到差异请提交脱敏后的复现请求。
+
 ## 运维
 
 | 脚本 | 作用 |
@@ -142,3 +160,9 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
 
 - `providers_config.json`、`vertex_sa_*.json`、`.env`、`litellm_config.yaml`、`logs/` 均包含真实凭证或已被 `.gitignore` 排除，**不会**被提交到仓库。首次部署需要自行创建这些文件或通过 Web 控制台填入。
 - 网关默认只监听 `127.0.0.1`。推理接口只检查 Bearer Token 非空，不校验身份；管理接口额外限制为同源浏览器或本机脚本调用，但仍不等同于用户认证。如需把 `proxy_host` 改为 `0.0.0.0`，必须在前面增加带认证的反向代理，不要直接暴露到公网。
+
+## 参与贡献与许可证
+
+提交问题或代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。安全问题请按照 [`SECURITY.md`](SECURITY.md) 私密报告，不要创建公开 Issue。
+
+本项目采用 [MIT License](LICENSE)。

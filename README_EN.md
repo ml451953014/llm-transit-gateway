@@ -2,6 +2,10 @@
 
 **English** | [简体中文](README.md)
 
+[![CI](https://github.com/ml451953014/llm-transit-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/ml451953014/llm-transit-gateway/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)
+
 Bring Gemini, Vertex AI, Claude, OpenAI, and other models into the AI tools you already use through one unified API.
 
 LLM Transit Gateway is a local-first, multi-provider compatibility gateway. It exposes OpenAI-compatible `/v1/chat/completions` and `/v1/responses` endpoints while connecting to the Gemini API, Google Vertex AI, AWS Bedrock, OpenAI, Anthropic, and custom OpenAI-compatible services.
@@ -121,6 +125,20 @@ For any client that accepts an OpenAI-compatible API, including Claude Code, cc-
 - API Key: any non-empty Bearer string. The gateway only checks that it is present; upstream authentication uses the provider credentials.
 - Model: prefer `provider-id/model-name`, for example `vertex_google/gemini-2.5-pro`. A bare model name is registered automatically only when it is globally unique. If multiple instances expose the same model, choose the default instance explicitly in the console.
 
+## Open-source Ecosystem and Compatible Clients
+
+This project uses [LiteLLM](https://github.com/BerriAI/litellm) as its upstream provider-routing layer and exposes standard model-list, Chat Completions, and Responses endpoints. Open-source clients that accept a custom OpenAI Base URL can usually connect directly:
+
+| Open-source project | Connection |
+|---|---|
+| [CC Switch](https://github.com/farion1231/cc-switch) | Add the gateway as a custom provider for Claude Code, Codex, Gemini CLI, and other tools. |
+| [Open WebUI](https://github.com/open-webui/open-webui) | Add an OpenAI-compatible connection with `http://localhost:4000/v1` as the Base URL. |
+| [Cline](https://github.com/cline/cline) | Select **OpenAI Compatible**, then enter the Base URL, any non-empty API key, and a model ID. |
+| [Continue](https://github.com/continuedev/continue) | Use the `openai` provider and point `apiBase` at this gateway. |
+| [Cherry Studio](https://github.com/CherryHQ/cherry-studio) | Add a custom OpenAI-compatible provider with the gateway URL. |
+
+Compatibility here covers model discovery and text/tool-calling endpoints. The gateway does not currently expose embeddings, speech, or image-generation APIs. Clients may send different extension fields; please report reproducible incompatibilities with all sensitive data removed.
+
 ## Operations
 
 | Command | Purpose |
@@ -142,3 +160,9 @@ Logs are stored in `logs/` as daily files. The Web console also exposes a live-l
 
 - `providers_config.json`, `vertex_sa_*.json`, `.env`, `litellm_config.yaml`, and `logs/` can contain real credentials and are excluded by `.gitignore`. Do not force-add them to Git.
 - The gateway listens on `127.0.0.1` by default. Inference endpoints only require a non-empty Bearer token, and management endpoints are restricted to same-origin browser requests or local scripts; this is not full user authentication. If you change `proxy_host` to `0.0.0.0`, place an authenticated reverse proxy in front of the gateway and never expose port 4000 directly to the public Internet.
+
+## Contributing and License
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening an issue or pull request. Report security issues privately by following [`SECURITY.md`](SECURITY.md), not through a public issue.
+
+This project is licensed under the [MIT License](LICENSE).

@@ -68,7 +68,7 @@ The two gateway layers have separate responsibilities: `proxy.py` handles reques
 ### Requirements
 
 - Python 3.11 (`start.sh` automatically searches for a compatible Conda environment)
-- Dependencies from [`requirements.txt`](requirements.txt): `litellm[proxy]`, `python-dotenv`, and `Pillow`
+- Dependencies from [`requirements.txt`](requirements.txt): `litellm[proxy]`, `python-dotenv`, `Pillow`, and `google-auth`
 
 ### Install
 

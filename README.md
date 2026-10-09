@@ -68,7 +68,7 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
 ### 依赖
 
 - Python 3.11（`start.sh` 会自动探测 conda 环境）
-- 见 [`requirements.txt`](requirements.txt)：`litellm[proxy]`、`python-dotenv`、`Pillow`
+- 见 [`requirements.txt`](requirements.txt)：`litellm[proxy]`、`python-dotenv`、`Pillow`、`google-auth`
 
 ### 安装
 

@@ -228,6 +228,35 @@ class ProxyRegressionTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in openai["messages"]], ["user", "assistant"])
         self.assertEqual([m["role"] for m in gemini["messages"]], ["user"])
 
+    def test_trailing_reasoning_items_are_trimmed_only_for_gemini(self):
+        def history():
+            return [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "x", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "think"}]},
+                {"type": "reasoning", "id": "rs_2", "summary": []},
+            ]
+        gemini = self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": history()})
+        self.assertEqual([i["type"] for i in gemini["input"]], ["message", "function_call", "function_call_output"])
+        other = self.clean({"model": "aicodewith/gpt-test", "input": history()})
+        self.assertEqual(len(other["input"]), 5)
+
+    def test_reasoning_in_the_middle_and_user_tail_are_kept_for_gemini(self):
+        items = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "a"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "b"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "c"}]},
+        ]
+        out = self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": items})
+        self.assertEqual([i["type"] for i in out["input"]], ["message", "reasoning", "message", "message"])
+
+    def test_string_input_and_all_reasoning_input_do_not_crash(self):
+        self.assertEqual(self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": "hi"})["input"], "hi")
+        out = self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": [{"type": "reasoning", "id": "rs_1", "summary": []}]})
+        self.assertEqual(out["input"], [])
+
     def test_bare_model_uses_provider_limit(self):
         old_owners = proxy._BARE_MODEL_PROVIDERS
         old_default = proxy._DEFAULT_CONCURRENCY

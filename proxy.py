@@ -1095,6 +1095,20 @@ def _clean_body(raw: bytes):
         if messages:
             data["messages"] = messages
 
+    # Responses API 的 input 列表同理。切回来继续对话时，Codex 回传的历史最后一项可能是官方
+    # OpenAI 产出的 reasoning 项（只有摘要、没有 Gemini 能用的内容）；LiteLLM 把它转成
+    # "model" 回合，整条请求以模型回合结尾，Vertex 直接 400：
+    #   "Requests ending with a model turn are not supported."
+    # 末尾的 reasoning 后面没有可对应的回答，去掉不丢信息。只处理实测复现的这一种形态。
+    if _is_gemini_model(data.get("model", "")) and isinstance(data.get("input"), list):
+        items = data["input"]
+        trimmed = 0
+        while items and isinstance(items[-1], dict) and items[-1].get("type") == "reasoning":
+            items.pop()
+            trimmed += 1
+        if trimmed:
+            print(f"[{time.strftime('%H:%M:%S')}] [WARN] Gemini 请求末尾有 {trimmed} 个 reasoning 项，已去掉（否则 Vertex 报 400 model turn）")
+
     # Responses API：禁用有状态存储，避免 LiteLLM 重建历史时把末尾 assistant 消息带给 Gemini
     if "input" in data:
         data["store"] = False

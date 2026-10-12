@@ -377,11 +377,19 @@ class SignedIdRegressionTests(unittest.TestCase):
         call = fixed["output"][0]
         self.assertLessEqual(len(call["call_id"]), 64)
         self.assertRegex(call["call_id"], r"^[A-Za-z0-9_-]+$")
-        self.assertEqual(call["id"], call["call_id"])
+        self.assertRegex(call["id"], r"^[A-Za-z0-9_-]+$")
+        self.assertLessEqual(len(call["id"]), 64)
         self.assertTrue(call["call_id"].startswith("call_363124_"))
+        self.assertTrue(call["id"].startswith("fc_363124_"), "function_call 项的 id 必须以 fc_ 开头")
 
-    def test_response_without_signature_is_returned_untouched(self):
+    def test_unsigned_function_call_gets_fc_item_id_and_keeps_call_id(self):
         raw = json.dumps({"output": [self.function_call("call_abc123")]}).encode()
+        call = json.loads(proxy._rewrite_signed_ids_json(raw, GEMINI))["output"][0]
+        self.assertEqual(call["call_id"], "call_abc123")
+        self.assertEqual(call["id"], "fc_abc123")
+
+    def test_response_without_any_call_id_is_returned_untouched(self):
+        raw = json.dumps({"output": [{"type": "message", "id": "msg_1", "content": []}]}).encode()
         self.assertIs(proxy._rewrite_signed_ids_json(raw, GEMINI), raw)
 
     def test_stream_rewrites_all_positions_consistently_for_every_chunk_size(self):
@@ -393,23 +401,59 @@ class SignedIdRegressionTests(unittest.TestCase):
                 out += rewriter.feed(data[i:i + size])
             out += rewriter.flush()
             self.assertNotIn(b"__thought__", out, f"chunk={size}")
-            ids = set()
+            item_ids, call_ids = set(), set()
             for line in out.decode().splitlines():
                 if not line.startswith("data:"):
                     continue
                 obj = json.loads(line[5:])
                 for node in (obj, obj.get("item") or {}, *((obj.get("response") or {}).get("output") or [])):
-                    for key in ("id", "call_id", "item_id"):
-                        if isinstance(node.get(key), str) and node[key].startswith("call_"):
-                            ids.add(node[key])
-            self.assertEqual(len(ids), 1, f"同一个工具调用的 id 必须改写成同一个值, chunk={size}: {ids}")
-            self.assertLessEqual(len(next(iter(ids))), 64)
+                    for key in ("id", "item_id"):
+                        if isinstance(node.get(key), str) and node[key].startswith("fc_"):
+                            item_ids.add(node[key])
+                    if isinstance(node.get("call_id"), str):
+                        call_ids.add(node["call_id"])
+            self.assertEqual(len(item_ids), 1, f"id/item_id 必须改写成同一个 fc_ 值, chunk={size}: {item_ids}")
+            self.assertEqual(len(call_ids), 1, f"call_id 必须改写成同一个值, chunk={size}: {call_ids}")
+            item_id, call_id = next(iter(item_ids)), next(iter(call_ids))
+            self.assertTrue(call_id.startswith("call_"))
+            self.assertLessEqual(max(len(item_id), len(call_id)), 64)
+            for value in (item_id, call_id):
+                self.assertRegex(value, r"^[A-Za-z0-9_-]+$")
+                self.assertEqual(proxy._restore_signed_id(value, GEMINI), SIGNED_ID)
 
-    def test_stream_without_signature_is_forwarded_byte_for_byte(self):
-        data = b"".join(self.stream_events("call_plain"))
+    def test_signed_item_id_and_call_id_share_one_full_id(self):
+        raw = json.dumps({"output": [self.function_call(SIGNED_ID)]}).encode()
+        call = json.loads(proxy._rewrite_signed_ids_json(raw, GEMINI))["output"][0]
+        self.assertTrue(call["id"].startswith("fc_"))
+        self.assertTrue(call["call_id"].startswith("call_"))
+        data = {"model": GEMINI, "input": [call, {"type": "function_call_output", "call_id": call["call_id"], "output": "ok"}]}
+        proxy._normalize_responses_ids(data)
+        self.assertEqual(data["input"][0]["id"], SIGNED_ID)
+        self.assertEqual(data["input"][0]["call_id"], SIGNED_ID)
+        self.assertEqual(data["input"][1]["call_id"], SIGNED_ID)
+
+    def test_stream_without_call_ids_is_forwarded_byte_for_byte(self):
+        data = self.sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hi"}) * 3
         rewriter = proxy._SignedIdStreamRewriter(GEMINI)
         out = rewriter.feed(data[:50]) + rewriter.feed(data[50:]) + rewriter.flush()
         self.assertEqual(out, data)
+
+    def test_unsigned_stream_only_changes_item_ids(self):
+        data = b"".join(self.stream_events("call_plain"))
+        rewriter = proxy._SignedIdStreamRewriter(GEMINI)
+        out = (rewriter.feed(data[:50]) + rewriter.feed(data[50:]) + rewriter.flush()).decode()
+        seen = {"id": set(), "item_id": set(), "call_id": set()}
+        for line in out.splitlines():
+            if not line.startswith("data:"):
+                continue
+            obj = json.loads(line[5:])
+            for node in (obj, obj.get("item") or {}, *((obj.get("response") or {}).get("output") or [])):
+                for key in seen:
+                    if isinstance(node.get(key), str):
+                        seen[key].add(node[key])
+        self.assertEqual(seen["call_id"], {"call_plain"})
+        self.assertEqual(seen["id"], {"fc_plain"})
+        self.assertEqual(seen["item_id"], {"fc_plain"})
 
     def test_short_id_is_restored_for_the_same_gemini_model(self):
         raw = json.dumps({"output": [self.function_call(SIGNED_ID)]}).encode()

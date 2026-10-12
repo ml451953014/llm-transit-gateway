@@ -636,10 +636,17 @@ def _is_responses_path(path: str) -> bool:
     return path.rstrip("/").endswith("responses")
 
 
-def _shorten_signed_id(full_id: str, model: str) -> str:
+def _shorten_signed_id(full_id: str, model: str, *, item_id: bool = False) -> str:
+    """item_id=True 生成 function_call 项自己的 id（官方 OpenAI 要求以 fc_ 开头），
+    否则生成 call_id（保持 call_ 开头）。两种形态都登记到缓存，都能还原出同一个完整 id。"""
     base = _INVALID_ID_CHARS_RE.sub("_", full_id.split(_THOUGHT_SIG_SEPARATOR, 1)[0]) or "call"
     digest = hashlib.sha1(full_id.encode()).hexdigest()[:10]
-    short = f"{base[:_RESPONSES_ID_MAX_LEN - len(digest) - 1]}_{digest}"
+    if item_id:
+        # fc_ 前缀 + 原 id 去掉 call_ 的部分，保持可读又能和 call_id 对上号
+        body = base[5:] if base.startswith("call_") else base
+        short = f"fc_{body}"[:_RESPONSES_ID_MAX_LEN - len(digest) - 1] + f"_{digest}"
+    else:
+        short = f"{base[:_RESPONSES_ID_MAX_LEN - len(digest) - 1]}_{digest}"
     with _signed_id_lock:
         _SIGNED_ID_CACHE[short] = (full_id, model)
         _SIGNED_ID_CACHE.move_to_end(short)
@@ -658,13 +665,39 @@ def _restore_signed_id(short_id: str, model: str):
         return entry[0]
 
 
+def _rewrite_one_id(key: str, value: str, model: str) -> str:
+    """改写单个 id 字段。规则：
+    - call_id / tool_call_id：保持 call_ 开头；带签名的换成短 id，没签名的原样。
+    - id / item_id：Gemini 返回的 function_call 项 id 与 call_id 是同一个 call_… 值，而官方
+      OpenAI 要求 function_call 项自己的 id 以 fc_ 开头（否则报 "Expected an ID that begins
+      with 'fc'"，客户端把它存进历史后切回官方账号就会失败），所以统一换成 fc_ 开头；
+      没有签名的也要换，不能只处理带 __thought__ 的。
+    """
+    if key not in _SIGNED_ID_KEYS:
+        return value
+    signed = _THOUGHT_SIG_SEPARATOR in value
+    if key in ("id", "item_id"):
+        if signed:
+            return _shorten_signed_id(value, model, item_id=True)
+        if value.startswith("call_"):
+            return ("fc_" + value[len("call_"):])[:_RESPONSES_ID_MAX_LEN]
+        return value
+    return _shorten_signed_id(value, model) if signed else value
+
+
+def _has_id_marker(data: bytes) -> bool:
+    """快速判断：不含 call_ 也不含签名分隔符的内容不可能有需要改写的 id。"""
+    return _SIGNED_MARK in data or b"call_" in data
+
+
 def _rewrite_signed_ids_in_obj(obj, model: str) -> bool:
     changed = False
     if isinstance(obj, dict):
         for key, value in obj.items():
             if isinstance(value, str):
-                if key in _SIGNED_ID_KEYS and _THOUGHT_SIG_SEPARATOR in value:
-                    obj[key] = _shorten_signed_id(value, model)
+                new = _rewrite_one_id(key, value, model)
+                if new != value:
+                    obj[key] = new
                     changed = True
             elif isinstance(value, (dict, list)) and _rewrite_signed_ids_in_obj(value, model):
                 changed = True
@@ -677,7 +710,7 @@ def _rewrite_signed_ids_in_obj(obj, model: str) -> bool:
 
 def _rewrite_signed_ids_json(raw: bytes, model: str) -> bytes:
     """没有需要改写的 id 时原样返回同一个对象（调用方可用 is 判断是否被改过）。"""
-    if _SIGNED_MARK not in raw:
+    if not _has_id_marker(raw):
         return raw
     try:
         obj = json.loads(raw)
@@ -689,11 +722,11 @@ def _rewrite_signed_ids_json(raw: bytes, model: str) -> bytes:
 
 
 def _rewrite_sse_event(event: bytes, model: str) -> bytes:
-    if _SIGNED_MARK not in event:
+    if not _has_id_marker(event):
         return event
     lines = event.split(b"\n")
     for i, line in enumerate(lines):
-        if line.startswith(b"data:") and _SIGNED_MARK in line:
+        if line.startswith(b"data:") and _has_id_marker(line):
             payload = line[5:].strip()
             fixed = _rewrite_signed_ids_json(payload, model)
             if fixed is not payload:
@@ -710,7 +743,7 @@ class _SignedIdStreamRewriter:
         self.buf = b""
 
     def _process(self, data: bytes) -> bytes:
-        if _SIGNED_MARK not in data:
+        if not _has_id_marker(data):
             return data
         parts = _SSE_SPLIT_RE.split(data)
         for i in range(0, len(parts), 2):   # 偶数位是事件，奇数位是边界

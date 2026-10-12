@@ -342,6 +342,115 @@ class ProxyRegressionTests(unittest.TestCase):
         self.assertNotIn("sensitive detail", response.body.decode())
 
 
+SIGNED_ID = "call_363124_" + "A1/b+C2d" * 12 + "__thought__" + "Zm9v/YmFy+" * 60   # 约 750 字符，含 / 和 +
+GEMINI = "vertex_ai/gemini-3.8-flash"
+
+
+class SignedIdRegressionTests(unittest.TestCase):
+    """Gemini 思维签名拼在工具调用 id 里（见 proxy.py 注释）：出站换短 id，入站按需回填。"""
+
+    def setUp(self):
+        proxy._SIGNED_ID_CACHE.clear()
+
+    @staticmethod
+    def function_call(call_id):
+        return {"type": "function_call", "id": call_id, "call_id": call_id, "name": "exec_command", "arguments": "{}"}
+
+    def sse(self, event, payload):
+        return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
+
+    def stream_events(self, call_id):
+        item = self.function_call(call_id)
+        return [
+            self.sse("response.created", {"type": "response.created", "response": {"output": []}}),
+            self.sse("response.output_item.added", {"type": "response.output_item.added", "item": item}),
+            self.sse("response.function_call_arguments.delta",
+                     {"type": "response.function_call_arguments.delta", "item_id": call_id, "delta": "{}"}),
+            self.sse("response.output_item.done", {"type": "response.output_item.done", "item": item}),
+            self.sse("response.completed",
+                     {"type": "response.completed", "response": {"output": [item]}}),
+        ]
+
+    def test_non_stream_response_gets_short_valid_ids(self):
+        raw = json.dumps({"output": [self.function_call(SIGNED_ID)]}).encode()
+        fixed = json.loads(proxy._rewrite_signed_ids_json(raw, GEMINI))
+        call = fixed["output"][0]
+        self.assertLessEqual(len(call["call_id"]), 64)
+        self.assertRegex(call["call_id"], r"^[A-Za-z0-9_-]+$")
+        self.assertEqual(call["id"], call["call_id"])
+        self.assertTrue(call["call_id"].startswith("call_363124_"))
+
+    def test_response_without_signature_is_returned_untouched(self):
+        raw = json.dumps({"output": [self.function_call("call_abc123")]}).encode()
+        self.assertIs(proxy._rewrite_signed_ids_json(raw, GEMINI), raw)
+
+    def test_stream_rewrites_all_positions_consistently_for_every_chunk_size(self):
+        data = b"".join(self.stream_events(SIGNED_ID))
+        for size in (1, 7, 64, 513, len(data)):
+            rewriter = proxy._SignedIdStreamRewriter(GEMINI)
+            out = b""
+            for i in range(0, len(data), size):
+                out += rewriter.feed(data[i:i + size])
+            out += rewriter.flush()
+            self.assertNotIn(b"__thought__", out, f"chunk={size}")
+            ids = set()
+            for line in out.decode().splitlines():
+                if not line.startswith("data:"):
+                    continue
+                obj = json.loads(line[5:])
+                for node in (obj, obj.get("item") or {}, *((obj.get("response") or {}).get("output") or [])):
+                    for key in ("id", "call_id", "item_id"):
+                        if isinstance(node.get(key), str) and node[key].startswith("call_"):
+                            ids.add(node[key])
+            self.assertEqual(len(ids), 1, f"同一个工具调用的 id 必须改写成同一个值, chunk={size}: {ids}")
+            self.assertLessEqual(len(next(iter(ids))), 64)
+
+    def test_stream_without_signature_is_forwarded_byte_for_byte(self):
+        data = b"".join(self.stream_events("call_plain"))
+        rewriter = proxy._SignedIdStreamRewriter(GEMINI)
+        out = rewriter.feed(data[:50]) + rewriter.feed(data[50:]) + rewriter.flush()
+        self.assertEqual(out, data)
+
+    def test_short_id_is_restored_for_the_same_gemini_model(self):
+        raw = json.dumps({"output": [self.function_call(SIGNED_ID)]}).encode()
+        short = json.loads(proxy._rewrite_signed_ids_json(raw, GEMINI))["output"][0]["call_id"]
+        data = {"model": GEMINI, "input": [self.function_call(short),
+                {"type": "function_call_output", "call_id": short, "output": "ok"}]}
+        proxy._normalize_responses_ids(data)
+        self.assertEqual(data["input"][0]["call_id"], SIGNED_ID)
+        self.assertEqual(data["input"][1]["call_id"], SIGNED_ID)
+
+    def test_short_id_is_not_restored_for_another_model(self):
+        raw = json.dumps({"output": [self.function_call(SIGNED_ID)]}).encode()
+        short = json.loads(proxy._rewrite_signed_ids_json(raw, GEMINI))["output"][0]["call_id"]
+        data = {"model": "aicodewith/gpt-test", "input": [self.function_call(short)]}
+        proxy._normalize_responses_ids(data)
+        self.assertEqual(data["input"][0]["call_id"], short)
+        self.assertNotIn("__thought__", data["input"][0]["call_id"])
+
+    def test_unknown_short_id_after_restart_falls_back_to_unsigned(self):
+        data = {"model": GEMINI, "input": [self.function_call("call_1_abcdef0123")]}
+        proxy._normalize_responses_ids(data)
+        self.assertEqual(data["input"][0]["call_id"], "call_1_abcdef0123")
+
+    def test_cache_is_bounded(self):
+        old = proxy._SIGNED_ID_CACHE_MAX
+        proxy._SIGNED_ID_CACHE_MAX = 5
+        try:
+            for i in range(20):
+                proxy._shorten_signed_id(f"call_{i}__thought__sig{i}", GEMINI)
+            self.assertEqual(len(proxy._SIGNED_ID_CACHE), 5)
+        finally:
+            proxy._SIGNED_ID_CACHE_MAX = old
+
+    def test_only_responses_path_of_gemini_models_is_rewritten(self):
+        self.assertTrue(proxy._is_responses_path("v1/responses"))
+        self.assertFalse(proxy._is_responses_path("v1/messages"))
+        self.assertFalse(proxy._is_responses_path("v1/chat/completions"))
+        self.assertTrue(proxy._is_gemini_model(GEMINI))
+        self.assertFalse(proxy._is_gemini_model("aicodewith/claude-haiku-4-5"))
+
+
 class UpdateConfigRegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_restart_does_not_block_loop_and_save_happens_after_ready(self):
         old_config = provider_config(selected_models=["model-a"])

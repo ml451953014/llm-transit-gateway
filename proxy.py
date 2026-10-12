@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -612,6 +613,128 @@ def _unwrap_encoded_item_id(raw: str) -> str:
     return raw
 
 
+# ── Gemini 思维签名：出站换成短 id，入站按需回填 ──────────────────────────────
+# LiteLLM 把 Gemini 的思维签名拼进工具调用 id（call_x__thought__<base64>），实测 137 字符、
+# 长会话里能到 2800+。Codex 把这个 id 原样存进会话历史；之后切到官方 OpenAI 账号做上下文
+# 压缩，请求直接发给 OpenAI、不经过本网关，就会被 "call_id: string too long (max 64)" 拒绝。
+# 请求方向的清理管不到这条路径，只能让返回给客户端的 id 本来就是短的、合规的。
+#
+# 做法：响应里把含 __thought__ 的 id 换成「原前缀 + 完整 id 的哈希」，完整 id 记在内存缓存里；
+# 下一轮客户端带着短 id 回来、且目标仍是产出它的那个 Gemini 模型时，再换回完整 id 让 LiteLLM
+# 取出真实签名。缓存丢了（网关重启）或换了模型，就退回到「不带签名」，与改动前的行为一致。
+_SIGNED_ID_CACHE: "OrderedDict[str, tuple]" = OrderedDict()   # 短 id -> (完整 id, 产出它的模型)
+_SIGNED_ID_CACHE_MAX = 4000
+_signed_id_lock = threading.Lock()
+_SIGNED_ID_KEYS = frozenset(("id", "call_id", "item_id", "tool_call_id"))
+_SIGNED_MARK = _THOUGHT_SIG_SEPARATOR.encode()
+_SSE_SPLIT_RE = re.compile(rb"(\r?\n\r?\n)")
+_SSE_BOUNDARY_RE = re.compile(rb"\r?\n\r?\n")
+_SSE_MAX_BUFFER = 8 * 1024 * 1024   # 一直没有事件边界时放弃缓冲，原样放行，避免卡住流
+
+
+def _is_responses_path(path: str) -> bool:
+    return path.rstrip("/").endswith("responses")
+
+
+def _shorten_signed_id(full_id: str, model: str) -> str:
+    base = _INVALID_ID_CHARS_RE.sub("_", full_id.split(_THOUGHT_SIG_SEPARATOR, 1)[0]) or "call"
+    digest = hashlib.sha1(full_id.encode()).hexdigest()[:10]
+    short = f"{base[:_RESPONSES_ID_MAX_LEN - len(digest) - 1]}_{digest}"
+    with _signed_id_lock:
+        _SIGNED_ID_CACHE[short] = (full_id, model)
+        _SIGNED_ID_CACHE.move_to_end(short)
+        while len(_SIGNED_ID_CACHE) > _SIGNED_ID_CACHE_MAX:
+            _SIGNED_ID_CACHE.popitem(last=False)
+    return short
+
+
+def _restore_signed_id(short_id: str, model: str):
+    """短 id 在缓存里、且产出它的模型就是本次目标模型时，返回带签名的完整 id，否则 None。"""
+    with _signed_id_lock:
+        entry = _SIGNED_ID_CACHE.get(short_id)
+        if entry is None or entry[1] != model:
+            return None
+        _SIGNED_ID_CACHE.move_to_end(short_id)
+        return entry[0]
+
+
+def _rewrite_signed_ids_in_obj(obj, model: str) -> bool:
+    changed = False
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(value, str):
+                if key in _SIGNED_ID_KEYS and _THOUGHT_SIG_SEPARATOR in value:
+                    obj[key] = _shorten_signed_id(value, model)
+                    changed = True
+            elif isinstance(value, (dict, list)) and _rewrite_signed_ids_in_obj(value, model):
+                changed = True
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)) and _rewrite_signed_ids_in_obj(item, model):
+                changed = True
+    return changed
+
+
+def _rewrite_signed_ids_json(raw: bytes, model: str) -> bytes:
+    """没有需要改写的 id 时原样返回同一个对象（调用方可用 is 判断是否被改过）。"""
+    if _SIGNED_MARK not in raw:
+        return raw
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return raw
+    if not _rewrite_signed_ids_in_obj(obj, model):
+        return raw
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def _rewrite_sse_event(event: bytes, model: str) -> bytes:
+    if _SIGNED_MARK not in event:
+        return event
+    lines = event.split(b"\n")
+    for i, line in enumerate(lines):
+        if line.startswith(b"data:") and _SIGNED_MARK in line:
+            payload = line[5:].strip()
+            fixed = _rewrite_signed_ids_json(payload, model)
+            if fixed is not payload:
+                lines[i] = b"data: " + fixed + (b"\r" if line.endswith(b"\r") else b"")
+    return b"\n".join(lines)
+
+
+class _SignedIdStreamRewriter:
+    """按 SSE 事件边界缓冲后改写：网络分片可能把一个事件、甚至一个 id 切成两段，
+    不能逐 chunk 处理。只缓冲到下一个事件边界，不引入额外等待。"""
+
+    def __init__(self, model: str):
+        self.model = model
+        self.buf = b""
+
+    def _process(self, data: bytes) -> bytes:
+        if _SIGNED_MARK not in data:
+            return data
+        parts = _SSE_SPLIT_RE.split(data)
+        for i in range(0, len(parts), 2):   # 偶数位是事件，奇数位是边界
+            parts[i] = _rewrite_sse_event(parts[i], self.model)
+        return b"".join(parts)
+
+    def feed(self, chunk: bytes) -> bytes:
+        self.buf += chunk
+        last = None
+        for last in _SSE_BOUNDARY_RE.finditer(self.buf):
+            pass
+        if last is None:
+            if len(self.buf) > _SSE_MAX_BUFFER:
+                out, self.buf = self.buf, b""
+                return out
+            return b""
+        ready, self.buf = self.buf[:last.end()], self.buf[last.end():]
+        return self._process(ready)
+
+    def flush(self) -> bytes:
+        data, self.buf = self.buf, b""
+        return self._process(data) if data else b""
+
+
 def _normalize_responses_ids(data: dict):
     """规范化 Responses API input 项的 id，使其满足上游的长度与字符集约束。
 
@@ -625,12 +748,23 @@ def _normalize_responses_ids(data: dict):
         return
 
     id_map: dict = {}
+    restored_map: dict = {}
+    target_model = data.get("model") or ""
 
     def normalize(raw):
         if not isinstance(raw, str) or not raw:
             return raw
         if raw in id_map:
             return id_map[raw]
+        if raw in restored_map:
+            return restored_map[raw]
+
+        # 本网关上一轮返回的短 id，且仍发给产出它的 Gemini 模型：换回带签名的完整 id，
+        # 让 LiteLLM 取出真实思维签名。这是有意保留 __thought__ 后缀的唯一情形。
+        restored = _restore_signed_id(raw, target_model)
+        if restored is not None:
+            restored_map[raw] = restored
+            return restored
 
         fixed = raw
         if fixed.startswith(_ENCITEM_PREFIX):
@@ -1178,6 +1312,9 @@ async def proxy(request: Request, path: str):
 
     upstream = f"http://localhost:{LITELLM_PORT}/{path}"
     semaphore = _semaphore_for_model(model_name)
+    # 只改 Responses 接口、且只改 Gemini 的响应；/v1/messages（Claude Code）、
+    # /v1/chat/completions 以及其他厂商的响应保持原样。
+    rewrite_signed_ids = _is_responses_path(path) and _is_gemini_model(model_name)
 
     async def acquire_slot():
         # 并发满时请求会在这里静默排队，客户端只感知到「变慢」。排队超过 1 秒就打一行，
@@ -1254,8 +1391,18 @@ async def proxy(request: Request, path: str):
                             # 429/5xx 属于可重试错误：直接结束流，客户端会自行重发
                             print(f"[{time.strftime('%H:%M:%S')}] [WARN] 上游返回 {resp.status_code}（已开流，结束流让客户端重试）：{model_name}")
                         return
-                    async for chunk in resp.aiter_raw():
-                        yield chunk
+                    if rewrite_signed_ids:
+                        rewriter = _SignedIdStreamRewriter(model_name)
+                        async for chunk in resp.aiter_raw():
+                            out = rewriter.feed(chunk)
+                            if out:
+                                yield out
+                        tail = rewriter.flush()
+                        if tail:
+                            yield tail
+                    else:
+                        async for chunk in resp.aiter_raw():
+                            yield chunk
                 except httpx.HTTPError as e:
                     # 上游流中途断开：不让异常冒到 uvicorn 刷整段栈；直接结束流，客户端
                     # （Codex）会把缺少 response.completed 当作可重试错误自行重发。
@@ -1291,7 +1438,10 @@ async def proxy(request: Request, path: str):
             }
             resp_headers["Access-Control-Allow-Origin"] = "*"
             resp_headers["Access-Control-Allow-Headers"] = "*"
-            return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
+            content = resp.content
+            if rewrite_signed_ids and resp.status_code < 400:
+                content = _rewrite_signed_ids_json(content, model_name)
+            return Response(content=content, status_code=resp.status_code, headers=resp_headers)
 
     except Exception as e:
         print(f"[ERROR] 转发至 LiteLLM 失败: {type(e).__name__}: {e}")

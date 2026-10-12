@@ -61,6 +61,13 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
   - 清理空/非法的 `tools` 字段
   - Gemini 要求对话以 user 消息结尾，自动裁剪末尾的 assistant 消息
   - Bedrock 专项修复：tool call ID 规范化（≤64 字符）、缺失 toolConfig 自动重建、超限图片自动缩放（多图请求单图长边 ≤2000px）、剔除 Bedrock 不支持的参数
+- **Gemini 思维签名与跨账号上下文压缩**：LiteLLM 会把 Gemini 的思维签名拼进工具调用 id（`call_x__thought__<base64>`），实测 137 字符，长会话可达 2800+，超过 OpenAI 要求的 64 字符。客户端（如 Codex）把它存进会话历史，之后切到官方 OpenAI 账号做上下文压缩时，请求直接发给 OpenAI、不经过本网关，会报 `call_id: string too long`。网关因此在**返回方向**处理：
+  - `/v1/responses` 的 Gemini 响应里，含 `__thought__` 的 id 换成「原前缀 + 完整 id 哈希」的短 id，满足 ≤64 字符且只含字母、数字、下划线、连字符；非流式 JSON 与流式 SSE 的全部位置（`output_item.added/done`、`function_call_arguments.delta/done`、`response.completed` 等）改写成同一个值，网络分片切在任意位置都不影响。
+  - 完整 id 记在网关内存缓存里（最多 4000 条，LRU）。下一轮客户端带着短 id 回来、目标仍是产出它的那个 Gemini 模型时，换回带签名的完整 id，Gemini 继续拿到上一轮的推理上下文；换了模型或网关重启导致缓存丢失，则退回到不带签名。
+  - 只影响 `/v1/responses` 且目标为 Gemini 的响应；`/v1/messages`（Claude Code）、`/v1/chat/completions` 与其他厂商的响应保持原样。
+- **流式请求的错误透传**：上游返回 4xx/5xx 时，网关把真实状态码和错误信息交给客户端，而不是回 `200` 再把错误 JSON 当流内容发出去（客户端会以为成功、却收不到任何合法事件而断开）。等待上游响应头最多 3 秒；超过则先开流，之后的 4xx 以 `response.failed` 事件告知，429/5xx 直接结束流让客户端重试。客户端在流开始前断开时，网关会关闭上游连接并归还并发名额。
+- **上游拒收时保留现场**：上游返回 4xx（429 除外）时，把网关实际转发的请求体存到 `logs/failed_requests/`（保留最近 20 份，目录已被 `.gitignore` 排除，内容含对话历史，不要手动提交）；日志里把长调用栈折叠成一行「上游拒绝」摘要。
+- **Gemini 结构化输出 + 大量工具**：Vertex Gemini 对「`text.format=json_schema`」与大量函数声明（实测 89 个通过、131 个报 `400 INVALID_ARGUMENT`）同时出现的请求直接拒收。函数数超过 80 且要求 JSON 输出时，网关去掉 `tools` 再转发（这类请求只要结构化输出、不调用工具）。
 - **按厂商分组的并发限流**：不同厂商的并发配额互不挤占（例如 Vertex 项目在高并发下容易 429，可以单独限制，不会拖累其他厂商）。在 Web 页面调整后无需重启整个网关进程即可生效。
 - **自动重试与 mid-stream 兜底**：所有厂商模型都配置了 LiteLLM 的 fallback（重试同一个模型），网络抖动导致的连接中断能自动恢复。
 - **实时日志广播 + 落盘**：控制台过滤纯噪音行，日志文件只记录 WARNING/ERROR/CRITICAL 及其 traceback，按天分文件，支持保留天数自动清理。
@@ -157,6 +164,9 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
 - **LiteLLM 内部 `Task exception was never retrieved` + `AttributeError: 'dict' object has no attribute 'usage'`**：LiteLLM 自身在组装流式响应统计信息时的已知内部问题，不影响请求结果（请求仍返回 200），`proxy.py` 的日志过滤器（`TeeStream`）会自动屏蔽，不会写入日志文件或打印到控制台。
 - **`MidStreamFallbackError` / `Vertex_ai_betaException`**：这是上游连接在流式传输中途真实中断（多为 Vertex 网络抖动），不是无害噪音。LiteLLM 的 fallback 机制会自动重试同一个模型，客户端通常感知不到（网关日志会看到一次 500 紧跟一次 200）。如果频率明显升高，考虑调低该厂商的并发上限。
 - **并发限制按厂商分组**：如果发现某个厂商的请求排队明显，去 Web 控制台「全局设置」调整该厂商的并发上限或默认并发上限，保存后立即生效，无需重启进程。
+- **Codex 切到官方 OpenAI 账号后压缩报 `Invalid 'input[N].call_id': string too long`**：说明会话历史里存着旧版网关返回的带签名长 id。升级到包含「Gemini 思维签名」修复的版本并重启网关后，**新产生**的工具调用才是短 id；已存进旧会话的长 id 无法回溯修复，需要新开会话。压缩到了官方 OpenAI 之后是否还有别的兼容问题（如 id 前缀、第三方加密推理内容），需要以实际报错为准。
+- **日志里出现 `[排队] ... 等待并发名额`**：说明该厂商的并发上限在起作用，请求在网关内排队，而不是上游慢；按需调高该厂商的并发上限。
+- **网关重启后第一次 Gemini 工具调用回合**：签名缓存在内存里，重启会清空，此时 LiteLLM 会使用占位签名，Gemini 的推理上下文可能略有损失，之后恢复正常。
 
 ## 安全注意事项
 

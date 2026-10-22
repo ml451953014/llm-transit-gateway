@@ -768,6 +768,257 @@ class _SignedIdStreamRewriter:
         return self._process(data) if data else b""
 
 
+def _split_concatenated_json(text):
+    """把 '{"a":1}{"b":2}' 这样首尾相连的多个 JSON 对象拆成列表；不是这种形态返回 None。"""
+    if not isinstance(text, str):
+        return None
+    dec = json.JSONDecoder()
+    s, i, objs = text.strip(), 0, []
+    while i < len(s):
+        try:
+            obj, i = dec.raw_decode(s, i)
+        except ValueError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        objs.append(obj)
+        while i < len(s) and s[i].isspace():
+            i += 1
+    return objs if len(objs) > 1 else None
+
+
+def _suffix_call_id(value, k: int):
+    """拆分出的第 k 个调用的 id。签名分隔符之前插入后缀，保证签名缓存还原出的签名不变。"""
+    if not isinstance(value, str) or not value or k == 0:
+        return value
+    if _THOUGHT_SIG_SEPARATOR in value:
+        head, sig = value.split(_THOUGHT_SIG_SEPARATOR, 1)
+        return f"{head}_{k}{_THOUGHT_SIG_SEPARATOR}{sig}"
+    return f"{value[:_RESPONSES_ID_MAX_LEN - 4]}_{k}"
+
+
+def _split_function_call_item(item):
+    """参数是多个 JSON 首尾相连的 function_call，拆成多个独立调用；不需要拆返回 None。"""
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return None
+    parts = _split_concatenated_json(item.get("arguments"))
+    if not parts:
+        return None
+    out = []
+    for k, p in enumerate(parts):
+        it = dict(item)
+        it["arguments"] = json.dumps(p, ensure_ascii=False)
+        it["id"] = _suffix_call_id(item.get("id"), k)
+        it["call_id"] = _suffix_call_id(item.get("call_id"), k)
+        out.append(it)
+    return out
+
+
+def _split_output_list(output):
+    new, changed = [], {}
+    for it in output:
+        parts = _split_function_call_item(it)
+        if parts:
+            changed[it.get("call_id")] = parts
+            new.extend(parts)
+        else:
+            new.append(it)
+    return new, changed
+
+
+def _split_merged_calls_json(raw: bytes) -> bytes:
+    if b"function_call" not in raw:
+        return raw
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return raw
+    output = obj.get("output") if isinstance(obj, dict) else None
+    if not isinstance(output, list):
+        return raw
+    new, changed = _split_output_list(output)
+    if not changed:
+        return raw
+    obj["output"] = new
+    print(f"[{time.strftime('%H:%M:%S')}] [WARN] 上游把 {sum(len(v) for v in changed.values())} 个工具调用合并成了 {len(changed)} 个，已拆开")
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+class _MergedCallStreamSplitter:
+    """流式响应里把「合并的工具调用」拆开。
+
+    某个 function_call 从 output_item.added 到 output_item.done 的事件先缓冲（参数很短，不影响
+    体验）；done 时参数是多个 JSON 首尾相连，就改成 N 组独立的 added/delta/done/done 事件，后续
+    事件的 output_index 和 sequence_number 相应顺延，response.completed 里的 output 也一起拆。
+    不含 function_call 的数据原样放行，字节不变。
+    """
+
+    _MAX_HELD = 5000
+
+    def __init__(self, model: str):
+        self.model = model
+        self.buf = b""
+        self.held = None        # [(event_bytes, sep, obj)]
+        self.held_idx = None
+        self.shift = 0          # 已额外插入的输出项个数
+        self.seq_shift = 0      # 已额外插入的事件个数
+
+    @staticmethod
+    def _parse(ev: bytes):
+        lines = ev.split(b"\n")
+        data = [l for l in lines if l.startswith(b"data:")]
+        has_event = any(l.startswith(b"event:") for l in lines)
+        if len(data) != 1:
+            return None, has_event
+        payload = data[0][5:].strip()
+        if not payload.startswith(b"{"):
+            return None, has_event
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            return None, has_event
+        return (obj if isinstance(obj, dict) else None), has_event
+
+    @staticmethod
+    def _encode(obj: dict, has_event: bool, sep: bytes) -> bytes:
+        body = b"data: " + json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+        if has_event:
+            body = b"event: " + str(obj.get("type", "")).encode() + b"\n" + body
+        return body + sep
+
+    def _rebuild(self, ev: bytes, obj: dict, sep: bytes) -> bytes:
+        new_data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+        out, placed = [], False
+        for line in ev.split(b"\n"):
+            if line.startswith(b"data:"):
+                if not placed:
+                    out.append(b"data: " + new_data + (b"\r" if line.endswith(b"\r") else b""))
+                    placed = True
+            else:
+                out.append(line)
+        return b"\n".join(out) + sep
+
+    def _emit(self, ev: bytes, sep: bytes, obj) -> bytes:
+        if obj is None:
+            return ev + sep
+        changed = False
+        if self.shift and isinstance(obj.get("output_index"), int):
+            obj["output_index"] += self.shift
+            changed = True
+        if self.seq_shift and isinstance(obj.get("sequence_number"), int):
+            obj["sequence_number"] += self.seq_shift
+            changed = True
+        resp = obj.get("response")
+        if isinstance(resp, dict) and isinstance(resp.get("output"), list):
+            new, split = _split_output_list(resp["output"])
+            if split:
+                resp["output"] = new
+                changed = True
+        return self._rebuild(ev, obj, sep) if changed else ev + sep
+
+    def _release_held(self) -> bytes:
+        held, self.held = self.held or [], None
+        return b"".join(self._emit(ev, sep, obj) for ev, sep, obj in held)
+
+    def _finish_held(self) -> bytes:
+        held = self.held
+        parts = _split_function_call_item((held[-1][2] or {}).get("item"))
+        if not parts:
+            return self._release_held()
+        added, sep = held[0][2], held[0][1]
+        _, has_event = self._parse(held[0][0])
+        common = {k: v for k, v in added.items()
+                  if k not in ("type", "item", "output_index", "sequence_number", "item_id", "delta", "arguments", "name")}
+        base_idx = self.held_idx + self.shift
+        seq = added.get("sequence_number")
+        if isinstance(seq, int):
+            seq += self.seq_shift
+        events = []
+        for k, part in enumerate(parts):
+            idx = base_idx + k
+            start = dict(part, arguments="", status="in_progress")
+            group = [
+                {"type": "response.output_item.added", "output_index": idx, "item": start},
+                {"type": "response.function_call_arguments.delta", "item_id": part.get("id"), "output_index": idx, "delta": part["arguments"]},
+                {"type": "response.function_call_arguments.done", "item_id": part.get("id"), "output_index": idx, "arguments": part["arguments"]},
+                {"type": "response.output_item.done", "output_index": idx, "item": part},
+            ]
+            if part.get("name"):
+                group[2]["name"] = part["name"]
+            for e in group:
+                e.update(common)
+                if isinstance(seq, int):
+                    e["sequence_number"] = seq
+                    seq += 1
+                events.append(e)
+        if isinstance(added.get("sequence_number"), int):
+            self.seq_shift += len(events) - len(held)
+        self.shift += len(parts) - 1
+        self.held = None
+        print(f"[{time.strftime('%H:%M:%S')}] [WARN] 上游把 {len(parts)} 个工具调用合并成了 1 个，已拆开：{self.model}")
+        return b"".join(self._encode(e, has_event, sep) for e in events)
+
+    def _process_event(self, ev: bytes, sep: bytes) -> bytes:
+        obj, _ = self._parse(ev)
+        if self.held is not None:
+            if obj is not None and obj.get("output_index") == self.held_idx and len(self.held) < self._MAX_HELD:
+                self.held.append((ev, sep, obj))
+                if obj.get("type") == "response.output_item.done":
+                    return self._finish_held()
+                return b""
+            return self._release_held() + self._emit(ev, sep, obj)
+        if obj is not None and obj.get("type") == "response.output_item.added" \
+                and (obj.get("item") or {}).get("type") == "function_call" and isinstance(obj.get("output_index"), int):
+            self.held, self.held_idx = [(ev, sep, obj)], obj["output_index"]
+            return b""
+        return self._emit(ev, sep, obj)
+
+    def _process(self, data: bytes) -> bytes:
+        if self.held is None and not self.shift and not self.seq_shift and b"function_call" not in data:
+            return data
+        parts = _SSE_SPLIT_RE.split(data)
+        out = []
+        for i in range(0, len(parts), 2):
+            ev = parts[i]
+            sep = parts[i + 1] if i + 1 < len(parts) else b""
+            if ev or sep:
+                out.append(self._process_event(ev, sep))
+        return b"".join(out)
+
+    def feed(self, chunk: bytes) -> bytes:
+        self.buf += chunk
+        last = None
+        for last in _SSE_BOUNDARY_RE.finditer(self.buf):
+            pass
+        if last is None:
+            if len(self.buf) > _SSE_MAX_BUFFER:
+                out, self.buf = self.buf, b""
+                return self._release_held() + out
+            return b""
+        ready, self.buf = self.buf[:last.end()], self.buf[last.end():]
+        return self._process(ready)
+
+    def flush(self) -> bytes:
+        data, self.buf = self.buf, b""
+        out = self._process(data) if data else b""
+        return out + self._release_held()
+
+
+def _repair_call_arguments(args):
+    """工具调用参数不是单个 JSON 对象时返回修复后的字符串，否则返回 None（不需要改）。"""
+    if not isinstance(args, str) or not args.strip():
+        return None
+    try:
+        if isinstance(json.loads(args), dict):
+            return None
+    except ValueError:
+        pass
+    parts = _split_concatenated_json(args)
+    if parts:
+        return json.dumps(parts[0], ensure_ascii=False)
+    return "{}"
+
+
 def _normalize_responses_ids(data: dict):
     """规范化 Responses API input 项的 id，使其满足上游的长度与字符集约束。
 
@@ -1072,6 +1323,20 @@ def _clean_body(raw: bytes):
                 json.loads(args)
             except (json.JSONDecodeError, ValueError):
                 fn["arguments"] = "{}"
+
+    # Responses API 的 input 列表同理。实测 aicodewith 的 Gemini 会把一次并行的多个工具调用合并成
+    # 一个 function_call，arguments 变成几个 JSON 首尾相连（{"cmd":"a"}{"cmd":"b"}）。客户端解析失败、
+    # 不执行，但这条记录会留在历史里，之后 Gemini 解析不了 → 400 "Invalid value at
+    # 'contents[N].parts[0].function_call.args'"。这条调用实际没执行过，改写不影响对话结果。
+    repaired_args = 0
+    for item in data.get("input") if isinstance(data.get("input"), list) else []:
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            fixed = _repair_call_arguments(item.get("arguments"))
+            if fixed is not None:
+                item["arguments"] = fixed
+                repaired_args += 1
+    if repaired_args:
+        print(f"[{time.strftime('%H:%M:%S')}] [WARN] 历史里有 {repaired_args} 个工具调用参数不是单个 JSON 对象，已修复（否则上游解析参数时报 400）")
 
     # 清理 invalid / empty tools (例如 [{}] 或包含空字典的 tool)
     if "tools" in data:
@@ -1464,12 +1729,16 @@ async def proxy(request: Request, path: str):
                             print(f"[{time.strftime('%H:%M:%S')}] [WARN] 上游返回 {resp.status_code}（已开流，结束流让客户端重试）：{model_name}")
                         return
                     if rewrite_signed_ids:
+                        # 先拆合并的工具调用（id 还是原样、带签名），再换短 id
+                        splitter = _MergedCallStreamSplitter(model_name)
                         rewriter = _SignedIdStreamRewriter(model_name)
                         async for chunk in resp.aiter_raw():
-                            out = rewriter.feed(chunk)
+                            out = splitter.feed(chunk)
+                            out = rewriter.feed(out) if out else b""
                             if out:
                                 yield out
-                        tail = rewriter.flush()
+                        tail = splitter.flush()
+                        tail = (rewriter.feed(tail) if tail else b"") + rewriter.flush()
                         if tail:
                             yield tail
                     else:
@@ -1512,6 +1781,7 @@ async def proxy(request: Request, path: str):
             resp_headers["Access-Control-Allow-Headers"] = "*"
             content = resp.content
             if rewrite_signed_ids and resp.status_code < 400:
+                content = _split_merged_calls_json(content)
                 content = _rewrite_signed_ids_json(content, model_name)
             return Response(content=content, status_code=resp.status_code, headers=resp_headers)
 

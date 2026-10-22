@@ -280,6 +280,24 @@ class ProxyRegressionTests(unittest.TestCase):
         out = self.clean({"model": "gemini-4-argon", "input": items})
         self.assertEqual(out["input"], items)
 
+    def test_merged_call_arguments_in_history_are_repaired(self):
+        merged = '{"cmd":"cat a.md"}{"cmd":"cat b.md"}'
+        items = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "x"}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "sh", "arguments": merged},
+            {"type": "function_call_output", "call_id": "call_1", "output": "failed to parse"},
+            {"type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "sh", "arguments": "not json"},
+            {"type": "function_call_output", "call_id": "call_2", "output": "x"},
+            {"type": "function_call", "id": "fc_3", "call_id": "call_3", "name": "sh", "arguments": '{"cmd":"ok"}'},
+            {"type": "function_call_output", "call_id": "call_3", "output": "x"},
+        ]
+        for model in ("aicodewith/gemini-4-argon", "aicodewith/gpt-test"):
+            out = self.clean({"model": model, "input": json.loads(json.dumps(items))})
+            calls = [i for i in out["input"] if i["type"] == "function_call"]
+            self.assertEqual(json.loads(calls[0]["arguments"]), {"cmd": "cat a.md"})
+            self.assertEqual(calls[1]["arguments"], "{}")
+            self.assertEqual(calls[2]["arguments"], '{"cmd":"ok"}')
+
     def test_string_input_and_all_reasoning_input_do_not_crash(self):
         self.assertEqual(self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": "hi"})["input"], "hi")
         out = self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": [{"type": "reasoning", "id": "rs_1", "summary": []}]})
@@ -543,6 +561,74 @@ class SignedIdRegressionTests(unittest.TestCase):
             self.assertEqual(len(proxy._SIGNED_ID_CACHE), 5)
         finally:
             proxy._SIGNED_ID_CACHE_MAX = old
+
+    def merged_stream(self, call_id, args_list):
+        merged = "".join(json.dumps(a) for a in args_list)
+        item = {"type": "function_call", "id": call_id, "call_id": call_id, "name": "sh", "arguments": ""}
+        done = dict(item, arguments=merged, status="completed")
+        evs = [
+            {"type": "response.created", "sequence_number": 0, "response": {"output": []}},
+            {"type": "response.output_item.added", "sequence_number": 1, "output_index": 0, "item": item},
+        ]
+        seq = 2
+        for a in args_list:
+            evs.append({"type": "response.function_call_arguments.delta", "sequence_number": seq, "output_index": 0, "item_id": call_id, "delta": json.dumps(a)})
+            seq += 1
+        evs += [
+            {"type": "response.function_call_arguments.done", "sequence_number": seq, "output_index": 0, "item_id": call_id, "arguments": merged},
+            {"type": "response.output_item.done", "sequence_number": seq + 1, "output_index": 0, "item": done},
+            {"type": "response.output_item.added", "sequence_number": seq + 2, "output_index": 1, "item": {"type": "message", "id": "msg_1", "role": "assistant", "content": []}},
+            {"type": "response.completed", "sequence_number": seq + 3, "response": {"output": [done, {"type": "message", "id": "msg_1"}]}},
+        ]
+        return b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in evs) + b"data: [DONE]\n\n"
+
+    def run_stream(self, data, size):
+        splitter = proxy._MergedCallStreamSplitter(GEMINI)
+        rewriter = proxy._SignedIdStreamRewriter(GEMINI)
+        out = b""
+        for i in range(0, len(data), size):
+            part = splitter.feed(data[i:i + size])
+            out += rewriter.feed(part) if part else b""
+        tail = splitter.flush()
+        out += (rewriter.feed(tail) if tail else b"") + rewriter.flush()
+        events = [json.loads(l[5:]) for l in out.decode().splitlines() if l.startswith("data:") and l[5:].strip().startswith("{")]
+        return out, events
+
+    def test_merged_parallel_calls_are_split_in_stream(self):
+        args = [{"cmd": "echo 1"}, {"cmd": "echo 2"}, {"cmd": "echo 3"}]
+        data = self.merged_stream(SIGNED_ID, args)
+        for size in (1, 13, 200, len(data)):
+            out, evs = self.run_stream(data, size)
+            done = [e["item"] for e in evs if e["type"] == "response.output_item.done" and e["item"]["type"] == "function_call"]
+            self.assertEqual([json.loads(d["arguments"]) for d in done], args, f"chunk={size}")
+            self.assertEqual(len({d["call_id"] for d in done}), 3)
+            self.assertEqual(len({d["id"] for d in done}), 3)
+            for d in done:
+                self.assertTrue(d["id"].startswith("fc_") and len(d["id"]) <= 64)
+                self.assertLessEqual(len(d["call_id"]), 64)
+                self.assertEqual(proxy._restore_signed_id(d["call_id"], GEMINI).split("__thought__")[1], SIGNED_ID.split("__thought__")[1])
+            seqs = [e["sequence_number"] for e in evs]
+            self.assertEqual(seqs, sorted(seqs)); self.assertEqual(len(seqs), len(set(seqs)))
+            msg = next(e for e in evs if e["type"] == "response.output_item.added" and e["item"]["type"] == "message")
+            self.assertEqual(msg["output_index"], 3)
+            completed = next(e for e in evs if e["type"] == "response.completed")["response"]["output"]
+            self.assertEqual([o["type"] for o in completed], ["function_call"] * 3 + ["message"])
+            self.assertTrue(out.endswith(b"data: [DONE]\n\n"))
+
+    def test_single_call_stream_passes_through_unchanged(self):
+        data = self.merged_stream("call_9", [{"cmd": "ls"}])
+        splitter = proxy._MergedCallStreamSplitter(GEMINI)
+        out = b"".join(splitter.feed(data[i:i + 7]) for i in range(0, len(data), 7)) + splitter.flush()
+        self.assertEqual(out, data)
+
+    def test_merged_calls_are_split_in_non_stream_json(self):
+        merged = {"type": "function_call", "id": "call_5", "call_id": "call_5", "name": "sh", "arguments": '{"cmd":"a"}{"cmd":"b"}'}
+        raw = json.dumps({"output": [merged]}).encode()
+        out = json.loads(proxy._split_merged_calls_json(raw))["output"]
+        self.assertEqual([json.loads(o["arguments"]) for o in out], [{"cmd": "a"}, {"cmd": "b"}])
+        self.assertEqual(len({o["call_id"] for o in out}), 2)
+        plain = json.dumps({"output": [dict(merged, arguments='{"cmd":"a"}')]}).encode()
+        self.assertIs(proxy._split_merged_calls_json(plain), plain)
 
     def test_only_responses_path_of_gemini_models_is_rewritten(self):
         self.assertTrue(proxy._is_responses_path("v1/responses"))

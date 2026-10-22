@@ -167,6 +167,8 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
 - **Codex 切到官方 OpenAI 账号后压缩报 `Invalid 'input[N].call_id': string too long`**：说明会话历史里存着旧版网关返回的带签名长 id。升级到包含「Gemini 思维签名」修复的版本并重启网关后，**新产生**的工具调用才是短 id；已存进旧会话的长 id 无法回溯修复，需要新开会话。压缩到了官方 OpenAI 之后是否还有别的兼容问题（如 id 前缀、第三方加密推理内容），需要以实际报错为准。
 - **切回官方 OpenAI 账号后报 `Invalid 'input[N].id': 'call_…'. Expected an ID that begins with 'fc'`**：同一类问题，会话历史里存着旧版网关返回的 `call_…` 形态的 function_call 项 id。新版本返回的是 `fc_…`；已存进旧会话的无法修复，需要新开会话。
 - **Gemini 报 `400 Requests ending with a model turn are not supported`**：从官方 OpenAI 账号切回本地 Gemini 继续对话时，Codex 回传的历史末尾可能是官方产出的 `reasoning` 项（只有摘要），被转成「模型回合」后整条请求以模型回合结尾，Vertex 拒收。网关会在目标为 Gemini 时去掉 `input` 末尾连续的 `reasoning` 项（日志会打一行 WARN）；中间的 `reasoning` 项和其他模型不受影响。
+- **Gemini 报 `contents[N].parts[0].data: required oneof field 'data'`**：历史里有只含空字符串的助手消息（Codex 在模型只调用工具时留下的）。网关转发给 Gemini 前会去掉空文本片段；如果客户端绕过网关直连中转站，这个清理不生效。
+- **Gemini 报 `Invalid value at 'contents[N].parts[0].function_call.args'`**：实测 aicodewith 的 Gemini 会把一次并行的多个工具调用合并成一个，参数变成几个 JSON 首尾相连，客户端执行失败，之后整段历史都会被拒。网关现在会把返回的合并调用拆成独立的调用（流式与非流式），并修复历史里已存在的合并参数（保留第一个命令，这条调用当时并未执行）。
 - **日志里出现 `[排队] ... 等待并发名额`**：说明该厂商的并发上限在起作用，请求在网关内排队，而不是上游慢；按需调高该厂商的并发上限。
 - **网关重启后第一次 Gemini 工具调用回合**：签名缓存在内存里，重启会清空，此时 LiteLLM 会使用占位签名，Gemini 的推理上下文可能略有损失，之后恢复正常。
 

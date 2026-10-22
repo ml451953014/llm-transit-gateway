@@ -166,6 +166,18 @@ FAILED_REQ_DIR = LOG_DIR / "failed_requests"
 _FAILED_REQ_KEEP = 20
 
 
+def _should_save_failed(status: int, err_body) -> bool:
+    """是否保存这次失败请求的请求体。4xx（除 429）要存；5xx 通常是上游故障、不值得存，但中转站
+    有时用 503 来表达「你的请求格式有误」（例如 aicodewith），这种是请求内容的问题，必须存下来才能排查。"""
+    if status == 429:
+        return False
+    if status < 500:
+        return True
+    if isinstance(err_body, (bytes, bytearray)):
+        err_body = err_body.decode("utf-8", "replace")
+    return isinstance(err_body, str) and "请求格式有误" in err_body
+
+
 def _save_failed_request(body: bytes, _model_name: str, status: int) -> None:
     """上游返回 4xx 时保存网关实际转发出去的请求体，只保留最近 _FAILED_REQ_KEEP 份。
 
@@ -1695,7 +1707,7 @@ async def proxy(request: Request, path: str):
                     finally:
                         await early.aclose()
                         semaphore.release()
-                    if early.status_code != 429 and early.status_code < 500:
+                    if _should_save_failed(early.status_code, err_body):
                         _save_failed_request(body, model_name, early.status_code)
                     return Response(
                         content=err_body,
@@ -1721,7 +1733,7 @@ async def proxy(request: Request, path: str):
                 try:
                     if resp.status_code >= 400:
                         err_body = await resp.aread()
-                        if resp.status_code != 429 and resp.status_code < 500:
+                        if _should_save_failed(resp.status_code, err_body):
                             _save_failed_request(body, model_name, resp.status_code)
                             yield _sse_error_event(path, resp.status_code, err_body)
                         else:

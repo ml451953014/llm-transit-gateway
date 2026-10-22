@@ -228,6 +228,14 @@ class ProxyRegressionTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in openai["messages"]], ["user", "assistant"])
         self.assertEqual([m["role"] for m in gemini["messages"]], ["user"])
 
+    def test_failed_request_is_saved_for_4xx_and_format_rejection_503_only(self):
+        self.assertTrue(proxy._should_save_failed(400, b"{}"))
+        self.assertFalse(proxy._should_save_failed(429, b"{}"))
+        rejected = '{"error":"请求格式有误。请先执行 /export，新建会话后将内容粘贴进去"}'.encode()
+        self.assertTrue(proxy._should_save_failed(503, rejected))
+        self.assertFalse(proxy._should_save_failed(503, b'{"error":"upstream timeout"}'))
+        self.assertFalse(proxy._should_save_failed(500, None))
+
     def test_trailing_reasoning_items_are_trimmed_only_for_gemini(self):
         def history():
             return [

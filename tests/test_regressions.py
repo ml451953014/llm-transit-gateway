@@ -252,6 +252,34 @@ class ProxyRegressionTests(unittest.TestCase):
         out = self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": items})
         self.assertEqual([i["type"] for i in out["input"]], ["message", "reasoning", "message", "message"])
 
+    def test_empty_text_parts_are_removed_only_for_gemini(self):
+        def history():
+            return [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "x", "arguments": "{}"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": ""}]},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "  "}, {"type": "output_text", "text": "done"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            ]
+        gemini = self.clean({"model": "gemini-4-argon", "input": history()})
+        self.assertEqual([i["type"] for i in gemini["input"]],
+                         ["message", "function_call", "function_call_output", "message", "message"])
+        self.assertEqual(gemini["input"][3]["content"], [{"type": "output_text", "text": "done"}])
+        other = self.clean({"model": "aicodewith/gpt-test", "input": history()})
+        self.assertEqual(len(other["input"]), 6)
+
+    def test_non_text_and_nonempty_parts_are_kept(self):
+        items = [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "look"}, {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "x"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ok"}]},
+        ]
+        out = self.clean({"model": "gemini-4-argon", "input": items})
+        self.assertEqual(out["input"], items)
+
     def test_string_input_and_all_reasoning_input_do_not_crash(self):
         self.assertEqual(self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": "hi"})["input"], "hi")
         out = self.clean({"model": "vertex_ai/gemini-3.8-flash", "input": [{"type": "reasoning", "id": "rs_1", "summary": []}]})

@@ -1109,6 +1109,31 @@ def _clean_body(raw: bytes):
         if trimmed:
             print(f"[{time.strftime('%H:%M:%S')}] [WARN] Gemini 请求末尾有 {trimmed} 个 reasoning 项，已去掉（否则 Vertex 报 400 model turn）")
 
+        # Codex 在模型只调用工具、没有说话时，会留下「只有一个空字符串文本」的助手消息。Gemini
+        # 不接受空 part，整条请求 400："contents[N].parts[0].data: required oneof field 'data'
+        # must have one initialized field"。去掉空文本片段；消息因此变空就整条去掉。
+        # 只动 input_text/output_text 且文本为空白的片段，图片等其他片段和本来就没有 content 的项不动。
+        removed_parts = removed_msgs = 0
+        cleaned_items = []
+        for it in items:
+            if isinstance(it, dict) and it.get("type") == "message" and isinstance(it.get("content"), list):
+                parts = it["content"]
+                kept = [
+                    p for p in parts
+                    if not (isinstance(p, dict) and p.get("type") in ("input_text", "output_text")
+                            and isinstance(p.get("text"), str) and not p["text"].strip())
+                ]
+                if len(kept) != len(parts):
+                    removed_parts += len(parts) - len(kept)
+                    if not kept:
+                        removed_msgs += 1
+                        continue
+                    it["content"] = kept
+            cleaned_items.append(it)
+        if removed_parts:
+            data["input"] = cleaned_items
+            print(f"[{time.strftime('%H:%M:%S')}] [WARN] Gemini 请求里有 {removed_parts} 个空文本片段（{removed_msgs} 条消息变空被去掉），已清理（否则报 400 oneof data）")
+
     # Responses API：禁用有状态存储，避免 LiteLLM 重建历史时把末尾 assistant 消息带给 Gemini
     if "input" in data:
         data["store"] = False

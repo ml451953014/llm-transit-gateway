@@ -42,6 +42,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 import provider_manager
+import empty_guard
 
 try:
     from PIL import Image
@@ -179,7 +180,7 @@ def _should_save_failed(status: int, err_body) -> bool:
     return isinstance(err_body, str) and "请求格式有误" in err_body
 
 
-def _save_failed_request(body: bytes, _model_name: str, status: int) -> None:
+def _save_failed_request(body: bytes, _model_name: str, status: int, note: str = "") -> None:
     """上游返回 4xx 时保存网关实际转发出去的请求体，只保留最近 _FAILED_REQ_KEEP 份。
 
     Vertex 的 400 只回一句 "Request contains an invalid argument"，不说是哪个字段，
@@ -192,7 +193,7 @@ def _save_failed_request(body: bytes, _model_name: str, status: int) -> None:
         (FAILED_REQ_DIR / name).write_bytes(body)
         for old in sorted(FAILED_REQ_DIR.glob("*.json"))[:-_FAILED_REQ_KEEP]:
             old.unlink(missing_ok=True)
-        print(f"[{time.strftime('%H:%M:%S')}] [WARN] 上游返回 {status}，请求体已保存：logs/failed_requests/{name}")
+        print(f"[{time.strftime('%H:%M:%S')}] [WARN] {note or f'上游返回 {status}'}，请求体已保存：logs/failed_requests/{name}")
     except Exception:
         pass
 
@@ -1832,11 +1833,14 @@ async def proxy(request: Request, path: str):
                             # 429/5xx 属于可重试错误：直接结束流，客户端会自行重发
                             print(f"[{time.strftime('%H:%M:%S')}] [WARN] 上游返回 {resp.status_code}（已开流，结束流让客户端重试）：{model_name}")
                         return
+                    watcher = empty_guard.StreamOutputWatcher() if _is_gemini_model(model_name) else None
                     if rewrite_signed_ids:
                         # 先拆合并的工具调用（id 还是原样、带签名），再换短 id
                         splitter = _MergedCallStreamSplitter(model_name)
                         rewriter = _SignedIdStreamRewriter(model_name)
                         async for chunk in resp.aiter_raw():
+                            if watcher:
+                                watcher.feed(chunk)
                             out = splitter.feed(chunk)
                             out = rewriter.feed(out) if out else b""
                             if out:
@@ -1847,7 +1851,12 @@ async def proxy(request: Request, path: str):
                             yield tail
                     else:
                         async for chunk in resp.aiter_raw():
+                            if watcher:
+                                watcher.feed(chunk)
                             yield chunk
+                    if watcher and watcher.is_empty():
+                        # 流已经发给客户端，无法重试；存请求体供排查
+                        _save_failed_request(body, model_name, 200, f"Gemini 流式返回空响应（无正文无工具调用）：{model_name}")
                 except httpx.HTTPError as e:
                     # 上游流中途断开：不让异常冒到 uvicorn 刷整段栈；直接结束流，客户端
                     # （Codex）会把缺少 response.completed 当作可重试错误自行重发。
@@ -1875,6 +1884,18 @@ async def proxy(request: Request, path: str):
                 )
             finally:
                 semaphore.release()
+            if (resp.status_code == 200 and _is_gemini_model(model_name)
+                    and empty_guard.is_empty_completion(resp.content)):
+                # Gemini 偶发只回思维签名、无正文（输出 0 token）；非流式还没发给客户端，可以直接重试一次
+                _save_failed_request(body, model_name, 200, f"Gemini 返回空响应，自动重试一次：{model_name}")
+                await acquire_slot()
+                try:
+                    resp = await _http_client.request(
+                        method=request.method, url=upstream, headers=headers,
+                        content=body, params=request.query_params,
+                    )
+                finally:
+                    semaphore.release()
             if 400 <= resp.status_code < 500 and resp.status_code != 429:
                 _save_failed_request(body, model_name, resp.status_code)
             resp_headers = {

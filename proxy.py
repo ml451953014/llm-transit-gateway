@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -534,6 +535,9 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 _admin_lock = asyncio.Lock()
+_gcloud_adc_process = None
+_gcloud_adc_process_lock = threading.Lock()
+_gcloud_adc_login_error = ""
 
 
 def _require_client_authorization(request: Request) -> None:
@@ -564,6 +568,50 @@ def _require_admin_request(request: Request) -> None:
     except ValueError:
         pass
     raise HTTPException(status_code=403, detail="管理接口只允许本机访问")
+
+
+def _require_local_admin_request(request: Request) -> None:
+    """执行本机程序的管理接口必须同时满足同源和本机访问。"""
+    _require_admin_request(request)
+    client_host = request.client.host if request.client else ""
+    try:
+        if ipaddress.ip_address(client_host).is_loopback:
+            return
+    except ValueError:
+        pass
+    raise HTTPException(status_code=403, detail="该操作只能在网关所在机器上执行")
+
+
+def _find_gcloud_binary() -> str:
+    found = shutil.which("gcloud")
+    if found:
+        return found
+    candidates = [
+        Path("/opt/homebrew/bin/gcloud"),
+        Path("/usr/local/bin/gcloud"),
+        Path.home() / "google-cloud-sdk" / "bin" / "gcloud",
+    ]
+    return str(next((path for path in candidates if path.is_file()), ""))
+
+
+def _gcloud_adc_login_state() -> dict:
+    global _gcloud_adc_process, _gcloud_adc_login_error
+    with _gcloud_adc_process_lock:
+        process = _gcloud_adc_process
+        if process is not None:
+            return_code = process.poll()
+            if return_code is None:
+                return {"running": True, "login_error": ""}
+            output, _ = process.communicate()
+            _gcloud_adc_process = None
+            if return_code:
+                logging.getLogger("gcloud_adc").warning(
+                    "gcloud ADC 登录失败（退出码 %s）：%s", return_code, (output or "").strip()
+                )
+                _gcloud_adc_login_error = "Google 授权未完成，请重试或使用终端命令"
+            else:
+                _gcloud_adc_login_error = ""
+        return {"running": False, "login_error": _gcloud_adc_login_error}
 
 _BEDROCK_ID_RE = re.compile(r'[^a-zA-Z0-9_.:-]')
 
@@ -1538,6 +1586,50 @@ async def restart_service_api(request: Request):
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/auth/gcloud-adc/status")
+async def gcloud_adc_status_api(request: Request):
+    _require_admin_request(request)
+    process_state = _gcloud_adc_login_state()
+    credential_state = await asyncio.to_thread(provider_manager.gcloud_adc_status)
+    return JSONResponse({
+        **credential_state,
+        **process_state,
+        "gcloud_installed": bool(_find_gcloud_binary()),
+        "command": "gcloud auth application-default login",
+    })
+
+
+@app.post("/api/auth/gcloud-adc/login")
+async def start_gcloud_adc_login_api(request: Request):
+    global _gcloud_adc_process, _gcloud_adc_login_error
+    _require_local_admin_request(request)
+
+    credential_state = await asyncio.to_thread(provider_manager.gcloud_adc_status)
+    if credential_state["ready"]:
+        return JSONResponse({**credential_state, "running": False, "status": "ready"})
+
+    gcloud_binary = _find_gcloud_binary()
+    if not gcloud_binary:
+        raise HTTPException(status_code=409, detail="未检测到 gcloud，请安装 Google Cloud CLI 或复制命令到终端执行")
+
+    with _gcloud_adc_process_lock:
+        if _gcloud_adc_process is not None and _gcloud_adc_process.poll() is None:
+            return JSONResponse({"ready": False, "running": True, "status": "running"})
+        try:
+            _gcloud_adc_login_error = ""
+            _gcloud_adc_process = subprocess.Popen(
+                [gcloud_binary, "auth", "application-default", "login", "--quiet"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=BASE_DIR,
+            )
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"无法启动 gcloud：{e}") from e
+    return JSONResponse({"ready": False, "running": True, "status": "started"})
 
 
 @app.get("/api/health")

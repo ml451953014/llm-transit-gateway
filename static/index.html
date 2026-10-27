@@ -231,6 +231,11 @@
     .vertex-credential-summary.ready { border-style: solid; border-color: rgba(16,185,129,0.35); color: var(--text-muted); }
     .vertex-credential-summary strong { color: var(--text-main); font-weight: 600; }
     #vertexDraftAdcPanel[hidden], #vertexDraftServiceAccountPanel[hidden] { display: none !important; }
+    .vertex-adc-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .vertex-adc-copy { min-width: 0; }
+    .vertex-adc-actions { display: flex; gap: 8px; flex-shrink: 0; }
+    .vertex-adc-actions [hidden], .vertex-auth-note code[hidden] { display: none !important; }
+    .vertex-adc-detail { display: block; margin-top: 2px; color: var(--text-dim); }
     .vertex-auth-note code {
       display: block; margin-top: 8px; padding: 8px 10px; border-radius: 6px;
       background: var(--bg-input); color: #93c5fd; overflow-wrap: anywhere; user-select: all;
@@ -484,6 +489,9 @@
     let vertexDraftAuthMode = 'gcloud_adc';
     let vertexDraftNameEdited = false;
     let vertexDraftIdEdited = false;
+    let vertexAdcReady = false;
+    let vertexAdcPollTimer = null;
+    const GCLOUD_ADC_COMMAND = 'gcloud auth application-default login';
     let activeApiEndpoint = 'models';
     const API_ENDPOINTS = {
       health: {
@@ -516,6 +524,111 @@
       return String(value ?? '').replace(/[&<>"']/g, ch => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       })[ch]);
+    }
+
+    function vertexAdcPanelHtml(id = '') {
+      return `
+        <div ${id ? `id="${id}"` : ''} class="vertex-credential-summary vertex-auth-note" data-gcloud-adc-card>
+          <div class="vertex-adc-head">
+            <div class="vertex-adc-copy">
+              <strong data-gcloud-adc-title>正在检测 Google 授权…</strong>
+              <span class="vertex-adc-detail" data-gcloud-adc-detail>请稍候</span>
+            </div>
+            <div class="vertex-adc-actions">
+              <button type="button" class="btn btn-primary btn-sm" data-gcloud-adc-login hidden
+                onclick="startVertexAdcLogin()"><i data-lucide="log-in"></i><span>登录 Google 账号</span></button>
+              <button type="button" class="btn btn-secondary btn-sm" data-gcloud-adc-fallback hidden
+                onclick="copyVertexAdcCommand(this)">
+                <i data-lucide="copy"></i><span>复制命令</span>
+              </button>
+            </div>
+          </div>
+          <code data-gcloud-adc-fallback hidden>${GCLOUD_ADC_COMMAND}</code>
+        </div>`;
+    }
+
+    function renderVertexAdcStatus(status) {
+      vertexAdcReady = Boolean(status.ready);
+      document.querySelectorAll('[data-gcloud-adc-card]').forEach(card => {
+        const title = card.querySelector('[data-gcloud-adc-title]');
+        const detail = card.querySelector('[data-gcloud-adc-detail]');
+        const login = card.querySelector('[data-gcloud-adc-login]');
+        const fallbacks = card.querySelectorAll('[data-gcloud-adc-fallback]');
+        card.classList.toggle('ready', vertexAdcReady);
+        fallbacks.forEach(fallback => { fallback.hidden = status.ready || status.running; });
+        if (status.ready) {
+          title.textContent = '正在复用本机 ADC';
+          detail.textContent = '无需重新登录；请填写本次要调用的目标项目 ID 和 Location';
+          login.hidden = true;
+        } else if (status.running) {
+          title.textContent = '等待浏览器完成 Google 授权';
+          detail.textContent = '授权成功后这里会自动更新，无需返回终端';
+          login.hidden = false;
+          login.disabled = true;
+          login.innerHTML = '<i data-lucide="loader-circle"></i><span>授权中…</span>';
+        } else {
+          title.textContent = status.gcloud_installed ? '尚未授权 Google 账号' : '未检测到 Google Cloud CLI';
+          detail.textContent = status.login_error || status.error || (status.gcloud_installed
+            ? '点击登录，浏览器将打开 Google 授权页面'
+            : '安装 gcloud 后重试，或在运行网关的机器上执行下方命令');
+          login.hidden = !status.gcloud_installed;
+          login.disabled = false;
+          login.innerHTML = '<i data-lucide="log-in"></i><span>登录 Google 账号</span>';
+        }
+      });
+      lucide.createIcons();
+    }
+
+    async function refreshVertexAdcStatus() {
+      clearTimeout(vertexAdcPollTimer);
+      try {
+        const response = await fetch('/api/auth/gcloud-adc/status');
+        const status = await response.json();
+        if (!response.ok) throw new Error(status.detail || '无法检测 ADC');
+        renderVertexAdcStatus(status);
+        if (status.running) vertexAdcPollTimer = setTimeout(refreshVertexAdcStatus, 1500);
+      } catch (e) {
+        renderVertexAdcStatus({ ready: false, gcloud_installed: false, error: e.message });
+      }
+    }
+
+    async function startVertexAdcLogin() {
+      document.querySelectorAll('[data-gcloud-adc-login]').forEach(button => { button.disabled = true; });
+      try {
+        const response = await fetch('/api/auth/gcloud-adc/login', { method: 'POST' });
+        const status = await response.json();
+        if (!response.ok) throw new Error(status.detail || '无法启动 Google 授权');
+        renderVertexAdcStatus({ ...status, gcloud_installed: true });
+        if (status.running) {
+          showToast('已打开 Google 授权，请在浏览器中完成登录', 'success');
+          vertexAdcPollTimer = setTimeout(refreshVertexAdcStatus, 1500);
+        }
+      } catch (e) {
+        showToast(`启动授权失败：${e.message}`, 'error');
+        await refreshVertexAdcStatus();
+      }
+    }
+
+    async function copyVertexAdcCommand(button) {
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(GCLOUD_ADC_COMMAND);
+        } else {
+          const input = document.createElement('textarea');
+          input.value = GCLOUD_ADC_COMMAND;
+          input.setAttribute('readonly', '');
+          input.style.position = 'fixed';
+          input.style.opacity = '0';
+          document.body.appendChild(input);
+          input.select();
+          const copied = document.execCommand('copy');
+          input.remove();
+          if (!copied) throw new Error('浏览器拒绝访问剪贴板');
+        }
+        showToast('已复制 gcloud ADC 登录命令', 'success');
+      } catch (e) {
+        showToast(`复制失败：${e.message}`, 'error');
+      }
     }
 
     async function checkHealth() {
@@ -770,12 +883,7 @@
               <input type="text" class="input-text" value="${escapeHtml(p.extra?.location || 'us-central1')}" onchange="updateExtra(${idx}, 'location', this.value)" placeholder="us-central1 / global" />
             </div>
           </div>
-          ${authMode === 'gcloud_adc' ? `
-            <div class="vertex-credential-summary ready vertex-auth-note">
-              <strong>使用运行网关的系统账号所配置的 ADC</strong><br>
-              无需在本项目保存私钥。首次使用请在同一系统账号下执行：
-              <code>gcloud auth application-default login</code>
-            </div>` : `
+          ${authMode === 'gcloud_adc' ? vertexAdcPanelHtml() : `
             <div class="credential-import-card">
               <div class="credential-import-copy">
                 <i data-lucide="file-json-2"></i>
@@ -878,6 +986,7 @@
         </div>
       `;
       renderSelectedList(idx);
+      if (p.type === 'vertex_ai' && vertexAuthMode(p) === 'gcloud_adc') refreshVertexAdcStatus();
     }
 
     // 主面板：单列展示已勾选模型（按名排序），可逐个移除
@@ -1591,7 +1700,7 @@
                 <div class="provider-catalog-grid">
                   ${providerCatalogCard({
                     name: 'Google Vertex AI', icon: 'cloud', status: providerCatalogStatus('vertex_ai'),
-                    description: '导入服务账号 JSON，为每个 Google Cloud 项目创建独立实例。',
+                    description: '使用 Google 账号一键授权或导入服务账号 JSON，为每个项目创建独立实例。',
                     action: 'openVertexProviderModal()'
                   })}
                   ${providerCatalogCard({
@@ -1675,11 +1784,7 @@
                 </select>
               </div>
 
-              <div id="vertexDraftAdcPanel" class="vertex-credential-summary ready vertex-auth-note">
-                <strong>先为运行网关的系统账号配置 ADC</strong><br>
-                这与 <code style="display:inline;padding:0;background:none;">gcloud auth login</code> 不同，只需在终端执行一次：
-                <code>gcloud auth application-default login</code>
-              </div>
+              ${vertexAdcPanelHtml('vertexDraftAdcPanel')}
 
               <div class="form-group" id="vertexDraftServiceAccountPanel" hidden>
                 <label class="form-label">服务账号 JSON<span class="field-required">*</span></label>
@@ -1745,6 +1850,7 @@
           </form>
         </div>`;
       lucide.createIcons();
+      refreshVertexAdcStatus();
       requestAnimationFrame(() => document.getElementById('vertexDraftAuthMode')?.focus());
     }
 
@@ -1758,6 +1864,7 @@
         pendingVertexCredentials = null;
         const error = document.getElementById('vertexCredentialsError');
         if (error) error.textContent = '';
+        refreshVertexAdcStatus();
       }
     }
 
@@ -1833,6 +1940,12 @@
       const requiredFields = ['vertexProviderProject', 'vertexProviderName', 'vertexProviderId', 'vertexProviderLocation'];
       const results = requiredFields.map(validateVertexProviderField);
       const requiresServiceAccount = vertexDraftAuthMode === 'service_account';
+      const requiresAdc = vertexDraftAuthMode === 'gcloud_adc';
+      if (requiresAdc && !vertexAdcReady) {
+        showToast('请先完成 Google 账号授权', 'error');
+        document.querySelector('[data-gcloud-adc-login]')?.focus();
+        return;
+      }
       if (requiresServiceAccount && !pendingVertexCredentials) {
         document.getElementById('vertexCredentialsError').textContent = '请先导入服务账号 JSON';
       }

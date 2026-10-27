@@ -107,7 +107,9 @@ To connect multiple Vertex projects, choose **Add Gateway → Google Vertex AI**
 
 #### Vertex AI with gcloud ADC (recommended)
 
-ADC uses short-lived access tokens, so the gateway does not copy or store a service-account private key. Run this command as the **same operating-system user that runs the gateway**:
+ADC uses short-lived access tokens, so the gateway does not copy or store a service-account private key. The Web console first checks whether the operating-system user running the gateway already has valid ADC. Existing credentials are reused without showing another login command. If ADC is missing or expired, click **Sign in with Google**; the gateway starts gcloud locally and opens Google's authorization page. This authorization is completed once and can be reused by multiple Vertex projects.
+
+If gcloud is not installed, the browser cannot be opened automatically, or the gateway runs in Docker/on a remote server, run the fallback command shown in the UI as the **same operating-system user that runs the gateway**:
 
 ```bash
 gcloud auth application-default login

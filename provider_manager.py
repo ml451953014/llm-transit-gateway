@@ -141,6 +141,37 @@ def gcloud_adc_credentials_path() -> Path:
     return config_dir / "application_default_credentials.json"
 
 
+def load_gcloud_adc_credentials():
+    """加载并刷新 gcloud ADC，确保文件存在不等于凭证仍然可用。"""
+    import google.auth
+    import google.auth.transport.requests
+    from google.auth.exceptions import GoogleAuthError
+
+    credentials_path = gcloud_adc_credentials_path()
+    if not credentials_path.is_file():
+        raise ValueError("尚未配置 gcloud ADC")
+    try:
+        credentials, project = google.auth.load_credentials_from_file(
+            str(credentials_path),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        credentials.refresh(google.auth.transport.requests.Request())
+    except (GoogleAuthError, OSError, json.JSONDecodeError, ValueError) as e:
+        raise ValueError(
+            "gcloud ADC 已失效或无法刷新，请重新执行 "
+            "gcloud auth application-default login"
+        ) from e
+    return credentials, project
+
+
+def gcloud_adc_status() -> Dict[str, Any]:
+    try:
+        _, project = load_gcloud_adc_credentials()
+        return {"ready": True, "project": project or ""}
+    except ValueError as e:
+        return {"ready": False, "project": "", "error": str(e)}
+
+
 def selected_models_for_provider(provider: Dict[str, Any]) -> List[str]:
     """返回明确选中的模型；仅旧配置缺少该字段时才回退到完整模型列表。"""
     selected = provider.get("selected_models")
@@ -487,28 +518,12 @@ def fetch_vertex_models_report(
     auth_mode: str = "service_account",
 ) -> Dict[str, Any]:
     """列出各 publisher 的候选模型，并保留每一组的成功或失败状态。"""
-    import google.auth
     import google.auth.transport.requests
-    from google.auth.exceptions import DefaultCredentialsError, RefreshError
     from google.oauth2 import service_account
 
     scopes = ["https://www.googleapis.com/auth/cloud-platform"]
     if auth_mode == "gcloud_adc":
-        credentials_path = gcloud_adc_credentials_path()
-        if not credentials_path.is_file():
-            raise ValueError(
-                "未找到 gcloud ADC，请先执行 gcloud auth application-default login"
-            )
-        try:
-            creds, detected_project = google.auth.load_credentials_from_file(
-                str(credentials_path), scopes=scopes
-            )
-            creds.refresh(google.auth.transport.requests.Request())
-        except (DefaultCredentialsError, RefreshError) as e:
-            raise ValueError(
-                "gcloud ADC 已失效或无法刷新，请重新执行 "
-                "gcloud auth application-default login"
-            ) from e
+        creds, detected_project = load_gcloud_adc_credentials()
         project = project or detected_project or ""
         if not project:
             raise ValueError("ADC 未提供默认项目，请填写 Vertex 项目 ID")
@@ -526,6 +541,9 @@ def fetch_vertex_models_report(
     if auth_mode == "service_account":
         creds.refresh(google.auth.transport.requests.Request())
     token = creds.token
+    headers = {"Authorization": f"Bearer {token}"}
+    if auth_mode == "gcloud_adc":
+        headers["x-goog-user-project"] = project
 
     host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
     models: List[str] = []
@@ -538,7 +556,7 @@ def fetch_vertex_models_report(
             url = f"https://{host}/v1beta1/publishers/{publisher}/models?pageSize=200"
             if page_token:
                 url += f"&pageToken={page_token}"
-            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+            req = urllib.request.Request(url, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     data = json.loads(resp.read().decode("utf-8"))

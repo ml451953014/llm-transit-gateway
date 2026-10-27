@@ -201,6 +201,10 @@ class ProviderManagerRegressionTests(unittest.TestCase):
             opened.call_args_list[0].args[0].headers["Authorization"],
             "Bearer adc-access-token",
         )
+        self.assertEqual(
+            opened.call_args_list[0].args[0].headers["X-goog-user-project"],
+            "explicit-project",
+        )
 
     def test_vertex_adc_refresh_error_explains_how_to_reauthenticate(self):
         credentials = mock.Mock()
@@ -481,6 +485,49 @@ class ProxyRegressionTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             proxy._require_admin_request(request)
         self.assertEqual(raised.exception.status_code, 403)
+
+    def test_gcloud_login_rejects_non_loopback_clients(self):
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/api/auth/gcloud-adc/login",
+            "headers": [
+                (b"host", b"gateway.example"),
+                (b"origin", b"https://gateway.example"),
+            ],
+            "client": ("203.0.113.10", 1234),
+            "server": ("gateway.example", 443),
+            "scheme": "https",
+        })
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(proxy.start_gcloud_adc_login_api(request))
+        self.assertEqual(raised.exception.status_code, 403)
+
+    def test_gcloud_login_only_launches_fixed_command(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        proxy._gcloud_adc_process = None
+        try:
+            with (
+                mock.patch.object(
+                    proxy.provider_manager,
+                    "gcloud_adc_status",
+                    return_value={"ready": False, "project": "", "error": "尚未配置"},
+                ),
+                mock.patch.object(proxy, "_find_gcloud_binary", return_value="/usr/local/bin/gcloud"),
+                mock.patch.object(proxy.subprocess, "Popen", return_value=process) as popen,
+            ):
+                response = asyncio.run(proxy.start_gcloud_adc_login_api(json_request({})))
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                popen.call_args.args[0],
+                ["/usr/local/bin/gcloud", "auth", "application-default", "login", "--quiet"],
+            )
+            self.assertNotIn("shell", popen.call_args.kwargs)
+        finally:
+            proxy._gcloud_adc_process = None
+            proxy._gcloud_adc_login_error = ""
 
     def test_failed_request_filename_does_not_use_model_name(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -888,6 +935,17 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn("delete provider.extra.private_key", self.html)
         self.assertIn("auth_mode: vertexDraftAuthMode", self.html)
         self.assertIn("const requiresServiceAccount = vertexDraftAuthMode === 'service_account'", self.html)
+
+    def test_vertex_adc_supports_status_detection_and_one_click_login(self):
+        self.assertIn("/api/auth/gcloud-adc/status", self.html)
+        self.assertIn("/api/auth/gcloud-adc/login", self.html)
+        self.assertIn("function startVertexAdcLogin()", self.html)
+        self.assertIn("登录 Google 账号", self.html)
+        self.assertIn("复制命令", self.html)
+        self.assertIn("if (requiresAdc && !vertexAdcReady)", self.html)
+        self.assertIn("正在复用本机 ADC", self.html)
+        self.assertIn("fallback.hidden = status.ready || status.running", self.html)
+        self.assertIn("data-gcloud-adc-fallback hidden", self.html)
 
     def test_vertex_project_can_be_created_as_an_independent_instance(self):
         self.assertIn('id="vertexProviderForm"', self.html)

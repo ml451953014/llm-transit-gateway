@@ -108,6 +108,7 @@ DEFAULT_PROVIDERS_CONFIG = {
             "models": [],
             "selected_models": [],
             "extra": {
+                "auth_mode": "gcloud_adc",
                 "project": "",
                 "client_email": "",
                 "private_key": "",
@@ -120,6 +121,24 @@ DEFAULT_PROVIDERS_CONFIG = {
 _SUPPORTED_PROVIDER_TYPES = {
     "gemini", "openai", "openai_compatible", "anthropic", "bedrock", "vertex_ai"
 }
+_VERTEX_AUTH_MODES = {"service_account", "gcloud_adc"}
+
+
+def vertex_auth_mode(provider: Dict[str, Any]) -> str:
+    """旧配置没有 auth_mode；它们只能是原有的服务账号模式。"""
+    return (provider.get("extra") or {}).get("auth_mode") or "service_account"
+
+
+def gcloud_adc_credentials_path() -> Path:
+    """返回 gcloud application-default login 写入的本地凭证路径。"""
+    configured_dir = os.environ.get("CLOUDSDK_CONFIG")
+    if configured_dir:
+        config_dir = Path(configured_dir).expanduser()
+    elif os.name == "nt":
+        config_dir = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "gcloud"
+    else:
+        config_dir = Path.home() / ".config" / "gcloud"
+    return config_dir / "application_default_credentials.json"
 
 
 def selected_models_for_provider(provider: Dict[str, Any]) -> List[str]:
@@ -231,6 +250,10 @@ def validate_config(config: Dict[str, Any]) -> None:
                 raise ValueError(f"providers[{index}].{field} 必须是字符串数组")
         if not isinstance(provider.get("extra", {}), dict):
             raise ValueError(f"providers[{index}].extra 必须是对象")
+        if provider.get("type") == "vertex_ai" and vertex_auth_mode(provider) not in _VERTEX_AUTH_MODES:
+            raise ValueError(
+                f"providers[{index}].extra.auth_mode 必须是 service_account 或 gcloud_adc"
+            )
 
 
 def _atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
@@ -343,7 +366,11 @@ def prune_vertex_credential_files(config: Dict[str, Any]) -> List[str]:
     keep = {
         f"vertex_sa_{provider['id']}.json"
         for provider in config.get("providers", [])
-        if provider.get("type") == "vertex_ai" and provider.get("id")
+        if (
+            provider.get("type") == "vertex_ai"
+            and provider.get("id")
+            and vertex_auth_mode(provider) == "service_account"
+        )
     }
     removed = []
     for path in BASE_DIR.glob("vertex_sa_*.json"):
@@ -453,23 +480,51 @@ def fetch_anthropic_models(base_url: str, api_key: str) -> List[str]:
 
 
 def fetch_vertex_models_report(
-    project: str, client_email: str, private_key: str, location: str
+    project: str,
+    client_email: str,
+    private_key: str,
+    location: str,
+    auth_mode: str = "service_account",
 ) -> Dict[str, Any]:
     """列出各 publisher 的候选模型，并保留每一组的成功或失败状态。"""
-    from google.oauth2 import service_account
+    import google.auth
     import google.auth.transport.requests
+    from google.auth.exceptions import DefaultCredentialsError, RefreshError
+    from google.oauth2 import service_account
 
-    info = {
-        "type": "service_account",
-        "project_id": project,
-        "client_email": client_email,
-        "private_key": private_key.replace("\\n", "\n"),
-        "token_uri": "https://oauth2.googleapis.com/token",
-    }
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    creds.refresh(google.auth.transport.requests.Request())
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    if auth_mode == "gcloud_adc":
+        credentials_path = gcloud_adc_credentials_path()
+        if not credentials_path.is_file():
+            raise ValueError(
+                "未找到 gcloud ADC，请先执行 gcloud auth application-default login"
+            )
+        try:
+            creds, detected_project = google.auth.load_credentials_from_file(
+                str(credentials_path), scopes=scopes
+            )
+            creds.refresh(google.auth.transport.requests.Request())
+        except (DefaultCredentialsError, RefreshError) as e:
+            raise ValueError(
+                "gcloud ADC 已失效或无法刷新，请重新执行 "
+                "gcloud auth application-default login"
+            ) from e
+        project = project or detected_project or ""
+        if not project:
+            raise ValueError("ADC 未提供默认项目，请填写 Vertex 项目 ID")
+    elif auth_mode == "service_account":
+        info = {
+            "type": "service_account",
+            "project_id": project,
+            "client_email": client_email,
+            "private_key": private_key.replace("\\n", "\n"),
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    else:
+        raise ValueError("Vertex 鉴权方式必须是 service_account 或 gcloud_adc")
+    if auth_mode == "service_account":
+        creds.refresh(google.auth.transport.requests.Request())
     token = creds.token
 
     host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
@@ -511,9 +566,17 @@ def fetch_vertex_models_report(
     return {"models": sorted(set(models)), "sources": sources}
 
 
-def fetch_vertex_models_api(project: str, client_email: str, private_key: str, location: str) -> List[str]:
+def fetch_vertex_models_api(
+    project: str,
+    client_email: str,
+    private_key: str,
+    location: str,
+    auth_mode: str = "service_account",
+) -> List[str]:
     """兼容原调用方，只返回 Vertex publisher 候选模型列表。"""
-    return fetch_vertex_models_report(project, client_email, private_key, location)["models"]
+    return fetch_vertex_models_report(
+        project, client_email, private_key, location, auth_mode=auth_mode
+    )["models"]
 
 
 def fetch_provider_models(provider: Dict[str, Any]) -> List[str]:
@@ -549,13 +612,18 @@ def fetch_provider_models(provider: Dict[str, Any]) -> List[str]:
 
     elif p_type == "vertex_ai":
         extra = provider.get("extra", {})
+        auth_mode = vertex_auth_mode(provider)
         project = (extra.get("project") or "").strip()
         client_email = (extra.get("client_email") or "").strip()
         private_key = (extra.get("private_key") or "").strip()
         location = extra.get("location", "us-central1") or "us-central1"
-        if not (project and client_email and private_key):
+        if not project:
+            raise ValueError("请先填写 Vertex 项目 ID")
+        if auth_mode == "service_account" and not (client_email and private_key):
             raise ValueError("请先填写 项目ID / 客户端邮箱 / 私钥 后再拉取模型")
-        return fetch_vertex_models_api(project, client_email, private_key, location)
+        return fetch_vertex_models_api(
+            project, client_email, private_key, location, auth_mode=auth_mode
+        )
 
     else:
         return provider.get("models", [])
@@ -567,13 +635,18 @@ def fetch_provider_models_report(provider: Dict[str, Any]) -> Dict[str, Any]:
         return {"models": fetch_provider_models(provider)}
 
     extra = provider.get("extra", {})
+    auth_mode = vertex_auth_mode(provider)
     project = (extra.get("project") or "").strip()
     client_email = (extra.get("client_email") or "").strip()
     private_key = (extra.get("private_key") or "").strip()
     location = extra.get("location", "us-central1") or "us-central1"
-    if not (project and client_email and private_key):
+    if not project:
+        raise ValueError("请先填写 Vertex 项目 ID")
+    if auth_mode == "service_account" and not (client_email and private_key):
         raise ValueError("请先填写 项目ID / 客户端邮箱 / 私钥 后再拉取模型")
-    return fetch_vertex_models_report(project, client_email, private_key, location)
+    return fetch_vertex_models_report(
+        project, client_email, private_key, location, auth_mode=auth_mode
+    )
 
 
 def generate_litellm_yaml(config: Dict[str, Any]) -> str:
@@ -625,10 +698,19 @@ def generate_litellm_yaml(config: Dict[str, Any]) -> str:
 
     self_fallbacks = json.dumps(fallback_pairs) if fallback_pairs else "[]"
 
-    # 预处理 Vertex AI：用 project_id/client_email/private_key 三项重建服务账号凭证文件
+    # 只有服务账号模式需要落凭证文件；gcloud ADC 直接引用其标准本地路径。
     vertex_creds = {}  # provider_id -> {"path": str, "project": str}
     for p in config.get("providers", []):
         if not p.get("enabled") or p.get("type") != "vertex_ai":
+            continue
+        auth_mode = vertex_auth_mode(p)
+        if auth_mode == "gcloud_adc":
+            if not gcloud_adc_credentials_path().is_file():
+                raise ValueError(
+                    "未找到 gcloud ADC，请先执行 gcloud auth application-default login"
+                )
+            continue
+        if auth_mode != "service_account":
             continue
         extra = p.get("extra", {})
         project = (extra.get("project") or "").strip()
@@ -723,7 +805,11 @@ def generate_litellm_yaml(config: Dict[str, Any]) -> str:
                     creds = vertex_creds.get(p.get("id"))
                     project = (creds or {}).get("project") or extra.get("project", "")
                     param_lines.append(f"      model: vertex_ai/{m}")
-                    if creds:
+                    if vertex_auth_mode(p) == "gcloud_adc":
+                        param_lines.append(
+                            f"      vertex_credentials: '{gcloud_adc_credentials_path()}'"
+                        )
+                    elif creds:
                         param_lines.append(f"      vertex_credentials: '{creds['path']}'")
                     if project:
                         param_lines.append(f"      vertex_project: '{project}'")

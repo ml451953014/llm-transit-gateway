@@ -230,6 +230,11 @@
     }
     .vertex-credential-summary.ready { border-style: solid; border-color: rgba(16,185,129,0.35); color: var(--text-muted); }
     .vertex-credential-summary strong { color: var(--text-main); font-weight: 600; }
+    #vertexDraftAdcPanel[hidden], #vertexDraftServiceAccountPanel[hidden] { display: none !important; }
+    .vertex-auth-note code {
+      display: block; margin-top: 8px; padding: 8px 10px; border-radius: 6px;
+      background: var(--bg-input); color: #93c5fd; overflow-wrap: anywhere; user-select: all;
+    }
 
     /* 敏感字段：右侧眼睛按钮 + 默认掩码 */
     .secret-wrap { position: relative; }
@@ -476,6 +481,7 @@
     let activeView = 0;   // 数字=provider索引；'test' / 'logs'
     let logInited = false;
     let pendingVertexCredentials = null;
+    let vertexDraftAuthMode = 'gcloud_adc';
     let vertexDraftNameEdited = false;
     let vertexDraftIdEdited = false;
     let activeApiEndpoint = 'models';
@@ -748,46 +754,61 @@
             </div>
           </div>`;
       } else if (p.type === 'vertex_ai') {
+        const authMode = vertexAuthMode(p);
         const hasCredentials = Boolean(p.extra?.project && p.extra?.client_email && p.extra?.private_key);
         extraFieldsHtml = `
-          <div class="credential-import-card">
-            <div class="credential-import-copy">
-              <i data-lucide="file-json-2"></i>
-              <div>
-                <div class="credential-import-title">${hasCredentials ? '当前项目凭证已配置' : '从服务账号 JSON 导入'}</div>
-                <div class="credential-import-help" id="vertexImportHelp_${idx}">
-                  ${hasCredentials ? `项目 ${escapeHtml(p.extra.project)}；导入新文件会更换这个实例的凭证。` : '自动填写项目 ID、客户端邮箱和私钥；Location 仍需手动确认。文件只在浏览器中解析。'}
-                </div>
-              </div>
-            </div>
-            <input type="file" class="credential-file-input" id="vertexCredentialsFile_${idx}"
-              accept=".json,application/json" aria-describedby="vertexImportHelp_${idx}"
-              onchange="importVertexServiceAccount(${idx}, this)" />
-            <button type="button" class="btn btn-secondary"
-              onclick="document.getElementById('vertexCredentialsFile_${idx}').click()">
-              <i data-lucide="upload"></i><span>${hasCredentials ? '更换凭证' : '导入 JSON'}</span>
-            </button>
-          </div>
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label">项目 ID（project_id）</label>
-              <input type="text" class="input-text" value="${escapeHtml(p.extra?.project || '')}" onchange="updateExtra(${idx}, 'project', this.value)" placeholder="your-gcp-project" />
+              <label class="form-label">鉴权方式</label>
+              <select class="input-text" onchange="setVertexAuthMode(${idx}, this.value)">
+                <option value="gcloud_adc" ${authMode === 'gcloud_adc' ? 'selected' : ''}>gcloud Application Default Credentials（推荐）</option>
+                <option value="service_account" ${authMode === 'service_account' ? 'selected' : ''}>服务账号 JSON</option>
+              </select>
             </div>
             <div class="form-group">
               <label class="form-label">地区 Location</label>
               <input type="text" class="input-text" value="${escapeHtml(p.extra?.location || 'us-central1')}" onchange="updateExtra(${idx}, 'location', this.value)" placeholder="us-central1 / global" />
             </div>
           </div>
-          <div class="form-group">
-            <label class="form-label">客户端邮箱（client_email）</label>
-            <input type="text" class="input-text" value="${escapeHtml(p.extra?.client_email || '')}" onchange="updateExtra(${idx}, 'client_email', this.value)" placeholder="xxx@xxx.iam.gserviceaccount.com" />
-          </div>
-          <div class="form-group">
-            <label class="form-label">私钥（private_key，粘贴 JSON 中的 private_key 字段值）</label>
-            <div class="secret-wrap is-textarea">
-              <textarea class="input-textarea secret secret-hidden" style="min-height:120px;" placeholder="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----" onchange="updateExtra(${idx}, 'private_key', this.value)">${escapeHtml(p.extra?.private_key || '')}</textarea>
-              <button type="button" class="eye-btn" onclick="toggleSecret(this)"><i data-lucide="eye-off"></i></button>
+          ${authMode === 'gcloud_adc' ? `
+            <div class="vertex-credential-summary ready vertex-auth-note">
+              <strong>使用运行网关的系统账号所配置的 ADC</strong><br>
+              无需在本项目保存私钥。首次使用请在同一系统账号下执行：
+              <code>gcloud auth application-default login</code>
+            </div>` : `
+            <div class="credential-import-card">
+              <div class="credential-import-copy">
+                <i data-lucide="file-json-2"></i>
+                <div>
+                  <div class="credential-import-title">${hasCredentials ? '当前项目凭证已配置' : '从服务账号 JSON 导入'}</div>
+                  <div class="credential-import-help" id="vertexImportHelp_${idx}">
+                    ${hasCredentials ? `项目 ${escapeHtml(p.extra.project)}；导入新文件会更换这个实例的凭证。` : '自动填写项目 ID、客户端邮箱和私钥；Location 仍需手动确认。文件只在浏览器中解析。'}
+                  </div>
+                </div>
+              </div>
+              <input type="file" class="credential-file-input" id="vertexCredentialsFile_${idx}"
+                accept=".json,application/json" aria-describedby="vertexImportHelp_${idx}"
+                onchange="importVertexServiceAccount(${idx}, this)" />
+              <button type="button" class="btn btn-secondary"
+                onclick="document.getElementById('vertexCredentialsFile_${idx}').click()">
+                <i data-lucide="upload"></i><span>${hasCredentials ? '更换凭证' : '导入 JSON'}</span>
+              </button>
             </div>
+            <div class="form-group">
+              <label class="form-label">客户端邮箱（client_email）</label>
+              <input type="text" class="input-text" value="${escapeHtml(p.extra?.client_email || '')}" onchange="updateExtra(${idx}, 'client_email', this.value)" placeholder="xxx@xxx.iam.gserviceaccount.com" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">私钥（private_key，粘贴 JSON 中的 private_key 字段值）</label>
+              <div class="secret-wrap is-textarea">
+                <textarea class="input-textarea secret secret-hidden" style="min-height:120px;" placeholder="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----" onchange="updateExtra(${idx}, 'private_key', this.value)">${escapeHtml(p.extra?.private_key || '')}</textarea>
+                <button type="button" class="eye-btn" onclick="toggleSecret(this)"><i data-lucide="eye-off"></i></button>
+              </div>
+            </div>
+          `}
+          <div class="form-group">
+            <label class="form-label">项目 ID（project_id）</label>
+            <input type="text" class="input-text" value="${escapeHtml(p.extra?.project || '')}" onchange="updateExtra(${idx}, 'project', this.value)" placeholder="your-gcp-project" />
           </div>`;
       }
 
@@ -1330,6 +1351,30 @@
       currentConfig.providers[idx].extra[field] = val.trim();
     }
 
+    function vertexAuthMode(provider) {
+      return provider?.extra?.auth_mode || 'service_account';
+    }
+
+    function setVertexAuthMode(idx, mode) {
+      const provider = currentConfig.providers[idx];
+      if (!provider || provider.type !== 'vertex_ai' || !['gcloud_adc', 'service_account'].includes(mode)) return;
+      if (!provider.extra) provider.extra = {};
+      provider.extra.auth_mode = mode;
+      if (mode === 'gcloud_adc') {
+        delete provider.extra.client_email;
+        delete provider.extra.private_key;
+      }
+      provider.models = [];
+      provider.selected_models = [];
+      provider.model_sources = [];
+      renderDetail();
+      renderSidebar();
+      lucide.createIcons();
+      showToast(mode === 'gcloud_adc'
+        ? '已切换为 ADC；保存后不再保留该实例的服务账号私钥'
+        : '已切换为服务账号；请导入 JSON 后重新拉取模型', 'success');
+    }
+
     function updateBareModelRoute(model, providerId) {
       if (!currentConfig.server) currentConfig.server = {};
       if (!currentConfig.server.bare_model_routes) currentConfig.server.bare_model_routes = {};
@@ -1377,7 +1422,7 @@
         if (!provider || provider.type !== 'vertex_ai') {
           throw new Error('当前厂商不是 Google Vertex AI');
         }
-        provider.extra = { ...(provider.extra || {}), ...credentials };
+        provider.extra = { ...(provider.extra || {}), ...credentials, auth_mode: 'service_account' };
         provider.models = [];
         provider.selected_models = [];
         provider.model_sources = [];
@@ -1605,6 +1650,7 @@
 
     function openVertexProviderModal() {
       pendingVertexCredentials = null;
+      vertexDraftAuthMode = 'gcloud_adc';
       vertexDraftNameEdited = false;
       vertexDraftIdEdited = false;
       document.getElementById('modalRoot').innerHTML = `
@@ -1614,7 +1660,7 @@
             <div class="modal-head">
               <div>
                 <div class="modal-title" id="vertexProviderTitle">添加 Vertex AI 项目</div>
-                <div class="modal-subtitle">一个 JSON 对应一个独立网关实例</div>
+                <div class="modal-subtitle">每个项目作为独立网关实例，可单独选择鉴权方式与模型</div>
               </div>
               <button type="button" class="modal-close-btn" onclick="closeModal()" aria-label="关闭添加 Vertex AI 项目弹窗">
                 <i data-lucide="x"></i>
@@ -1622,6 +1668,20 @@
             </div>
             <div class="modal-body">
               <div class="form-group">
+                <label class="form-label" for="vertexDraftAuthMode">鉴权方式<span class="field-required">*</span></label>
+                <select id="vertexDraftAuthMode" class="input-text" onchange="setVertexDraftAuthMode(this.value)">
+                  <option value="gcloud_adc" selected>gcloud Application Default Credentials（推荐，不保存私钥）</option>
+                  <option value="service_account">服务账号 JSON</option>
+                </select>
+              </div>
+
+              <div id="vertexDraftAdcPanel" class="vertex-credential-summary ready vertex-auth-note">
+                <strong>先为运行网关的系统账号配置 ADC</strong><br>
+                这与 <code style="display:inline;padding:0;background:none;">gcloud auth login</code> 不同，只需在终端执行一次：
+                <code>gcloud auth application-default login</code>
+              </div>
+
+              <div class="form-group" id="vertexDraftServiceAccountPanel" hidden>
                 <label class="form-label">服务账号 JSON<span class="field-required">*</span></label>
                 <input type="file" class="credential-file-input" id="vertexDraftFile"
                   accept=".json,application/json" onchange="importVertexDraftCredentials(this)" />
@@ -1633,6 +1693,15 @@
                   文件只在浏览器中解析；创建后会保存提取出的项目 ID、客户端邮箱和私钥。
                 </div>
                 <div class="field-error" id="vertexCredentialsError" role="alert" aria-live="polite"></div>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label" for="vertexProviderProject">项目 ID（project_id）<span class="field-required">*</span></label>
+                <input id="vertexProviderProject" type="text" class="input-text" maxlength="128" autocomplete="off"
+                  spellcheck="false" placeholder="your-gcp-project" aria-describedby="vertexProviderProjectHint vertexProviderProjectError"
+                  oninput="updateVertexDraftProject(this.value)" onblur="validateVertexProviderField(this.id)" />
+                <div class="field-hint" id="vertexProviderProjectHint">明确指定模型与配额所属的 Google Cloud 项目，不依赖自动推断</div>
+                <div class="field-error" id="vertexProviderProjectError" role="alert" aria-live="polite"></div>
               </div>
 
               <div class="provider-form-grid">
@@ -1676,7 +1745,32 @@
           </form>
         </div>`;
       lucide.createIcons();
-      requestAnimationFrame(() => document.getElementById('vertexDraftImportButton')?.focus());
+      requestAnimationFrame(() => document.getElementById('vertexDraftAuthMode')?.focus());
+    }
+
+    function setVertexDraftAuthMode(mode) {
+      vertexDraftAuthMode = mode === 'service_account' ? 'service_account' : 'gcloud_adc';
+      const adcPanel = document.getElementById('vertexDraftAdcPanel');
+      const serviceAccountPanel = document.getElementById('vertexDraftServiceAccountPanel');
+      if (adcPanel) adcPanel.hidden = vertexDraftAuthMode !== 'gcloud_adc';
+      if (serviceAccountPanel) serviceAccountPanel.hidden = vertexDraftAuthMode !== 'service_account';
+      if (vertexDraftAuthMode === 'gcloud_adc') {
+        pendingVertexCredentials = null;
+        const error = document.getElementById('vertexCredentialsError');
+        if (error) error.textContent = '';
+      }
+    }
+
+    function updateVertexDraftProject(value) {
+      const project = value.trim();
+      const nameInput = document.getElementById('vertexProviderName');
+      const idInput = document.getElementById('vertexProviderId');
+      if (!vertexDraftNameEdited || !nameInput.value.trim()) nameInput.value = project ? `Vertex AI · ${project}` : '';
+      if (!vertexDraftIdEdited || !idInput.value.trim()) idInput.value = project ? slugifyProviderId(`vertex_${project}`) : '';
+      clearCustomProviderError('vertexProviderProject');
+      clearCustomProviderError('vertexProviderName');
+      clearCustomProviderError('vertexProviderId');
+      updateVertexProviderPreview();
     }
 
     async function importVertexDraftCredentials(input) {
@@ -1685,10 +1779,8 @@
       try {
         if (file.size > 1024 * 1024) throw new Error('JSON 文件不能超过 1 MB');
         pendingVertexCredentials = parseVertexServiceAccountJson(await file.text());
-        const nameInput = document.getElementById('vertexProviderName');
-        const idInput = document.getElementById('vertexProviderId');
-        if (!vertexDraftNameEdited || !nameInput.value.trim()) nameInput.value = `Vertex AI · ${pendingVertexCredentials.project}`;
-        if (!vertexDraftIdEdited || !idInput.value.trim()) idInput.value = slugifyProviderId(`vertex_${pendingVertexCredentials.project}`);
+        document.getElementById('vertexProviderProject').value = pendingVertexCredentials.project;
+        updateVertexDraftProject(pendingVertexCredentials.project);
         const summary = document.getElementById('vertexDraftSummary');
         summary.classList.add('ready');
         summary.innerHTML = `<strong>${escapeHtml(pendingVertexCredentials.project)}</strong><br>${escapeHtml(pendingVertexCredentials.client_email)} · ${escapeHtml(file.name)}`;
@@ -1726,6 +1818,7 @@
       const value = input.value.trim();
       let message = '';
       if (inputId === 'vertexProviderName' && !value) message = '请输入实例名称';
+      else if (inputId === 'vertexProviderProject' && !value) message = '请输入 Vertex 项目 ID';
       else if (inputId === 'vertexProviderId') {
         if (!value) message = '请输入调用前缀';
         else if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(value)) message = '请使用 1–32 位小写字母、数字、下划线或连字符';
@@ -1737,23 +1830,28 @@
 
     function submitVertexProvider(event) {
       event.preventDefault();
-      const requiredFields = ['vertexProviderName', 'vertexProviderId', 'vertexProviderLocation'];
+      const requiredFields = ['vertexProviderProject', 'vertexProviderName', 'vertexProviderId', 'vertexProviderLocation'];
       const results = requiredFields.map(validateVertexProviderField);
-      if (!pendingVertexCredentials) document.getElementById('vertexCredentialsError').textContent = '请先导入服务账号 JSON';
+      const requiresServiceAccount = vertexDraftAuthMode === 'service_account';
+      if (requiresServiceAccount && !pendingVertexCredentials) {
+        document.getElementById('vertexCredentialsError').textContent = '请先导入服务账号 JSON';
+      }
       const firstInvalid = requiredFields.find((_, index) => !results[index]);
-      if (!pendingVertexCredentials || firstInvalid) {
+      if ((requiresServiceAccount && !pendingVertexCredentials) || firstInvalid) {
         (firstInvalid ? document.getElementById(firstInvalid) : document.getElementById('vertexDraftImportButton'))?.focus();
         return;
       }
 
+      const project = document.getElementById('vertexProviderProject').value.trim();
       const name = document.getElementById('vertexProviderName').value.trim();
       const id = document.getElementById('vertexProviderId').value.trim();
       const location = document.getElementById('vertexProviderLocation').value.trim();
+      const credentials = requiresServiceAccount ? pendingVertexCredentials : {};
       currentConfig.providers.push({
         id, name, type: 'vertex_ai', enabled: true, api_keys: [], base_url: '',
         models: [], selected_models: [], model_sources: [],
         extra: {
-          ...pendingVertexCredentials, location, managed_instance: true,
+          ...credentials, auth_mode: vertexDraftAuthMode, project, location, managed_instance: true,
           template_id: 'vertex_ai', instance_origin: 'user'
         }
       });

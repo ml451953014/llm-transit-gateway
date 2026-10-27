@@ -17,9 +17,9 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
 - **让 Gemini 用在更多 AI 工具中**：把 Gemini API 和 Vertex AI 模型统一转换为常见客户端能够识别的接口，可供 cc-switch、Cursor、VS Code 插件、OpenAI SDK 等工具使用。
 - **不是简单转发，而是兼容层**：修复不同客户端、LiteLLM 和上游厂商之间的请求差异，包括 Gemini 思维参数、tool call、结构化输出、消息尾部角色和无效字段。
 - **Gemini 思维签名与长会话兼容**：识别并清理跨模型历史中无意义的 `__thought__` 签名后缀，递归解包 LiteLLM 的 `encitem_` ID，并保持 tool call 引用关系一致，避免 Responses API 长会话因 ID 超长或字符非法而中断。
-- **多 Vertex 项目独立管理**：一个服务账号 JSON 对应一个独立网关实例，各自拥有凭证、模型权限、调用前缀和并发限制；同名模型可以显式指定默认路由，不会误入错误项目。
+- **多 Vertex 项目独立管理**：每个 Google Cloud 项目对应一个独立网关实例，可选择无长期私钥的 gcloud ADC 或服务账号 JSON，各自拥有模型权限、调用前缀和并发限制；同名模型可以显式指定默认路由，不会误入错误项目。
 - **针对 Agent 长会话优化**：自动修复损坏的工具参数、重建 Bedrock `toolConfig`、规范化 tool call ID，并处理流式首包超时、真实状态码透传和中途断流。
-- **可视化配置和排障**：通过 Web 控制台添加、删除和配置厂商，一键导入 Vertex 服务账号 JSON、拉取模型、测试全部对外接口并查看实时日志。
+- **可视化配置和排障**：通过 Web 控制台添加、删除和配置厂商，选择 Vertex ADC 或一键导入服务账号 JSON、拉取模型、测试全部对外接口并查看实时日志。
 
 ## 架构
 
@@ -46,10 +46,10 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
 
 ## 功能详情
 
-- **多厂商聚合**：Gemini、Vertex AI（Service Account）、AWS Bedrock（Bearer Token）、OpenAI、Anthropic Direct，以及任意数量的自定义 OpenAI 兼容线路（中转站、SiliconFlow 等）。
+- **多厂商聚合**：Gemini、Vertex AI（ADC 或 Service Account）、AWS Bedrock（Bearer Token）、OpenAI、Anthropic Direct，以及任意数量的自定义 OpenAI 兼容线路（中转站、SiliconFlow 等）。
 - **Web 管理控制台**（`http://localhost:4000/`）：
   - 按厂商配置 API Key / Base URL / 专属凭证字段
-  - 可创建多个 Vertex AI 项目实例：每个服务账号 JSON 对应独立凭证、模型集合和调用前缀
+  - 可创建多个 Vertex AI 项目实例：每个项目可独立选择 ADC 或服务账号、模型集合和调用前缀
   - 一键拉取厂商模型列表，勾选启用哪些模型
   - 全局设置：默认并发上限、按厂商单独覆盖并发上限、重试次数/间隔、请求超时
   - 内置连通性测试面板
@@ -103,7 +103,23 @@ LLM Transit Gateway 是一个本地优先的多厂商兼容网关。它向客户
 
 打开 `http://localhost:4000/`，在左侧选择厂商 → 填入 API Key（或 Vertex/Bedrock 的专属凭证字段）→ 点击「拉取模型」→ 勾选需要启用的模型 → 打开厂商启用开关 → 「保存并应用」。保存后会自动重新生成 `litellm_config.yaml` 并重启 LiteLLM 子进程。
 
-需要接入多个 Vertex 项目时，点击「添加网关」→「Google Vertex AI」，为每个项目分别导入服务账号 JSON。每个实例必须使用唯一调用前缀，例如 `vertex_google/`、`vertex_claude/`。拉取结果来自各 publisher 的 Model Garden 候选列表，并不等于账号一定有调用权限；请保存后用「API 接口」逐个确认。
+需要接入多个 Vertex 项目时，点击「添加网关」→「Google Vertex AI」，为每个项目创建实例并选择鉴权方式。每个实例必须使用唯一调用前缀，例如 `vertex_google/`、`vertex_claude/`。拉取结果来自各 publisher 的 Model Garden 候选列表，并不等于账号一定有调用权限；请保存后用「API 接口」逐个确认。
+
+#### Vertex AI 使用 gcloud ADC（推荐）
+
+ADC 使用短期访问令牌，网关不会复制或保存服务账号私钥。请用**运行网关的同一个系统账号**执行：
+
+```bash
+gcloud auth application-default login
+```
+
+然后在 Vertex 实例中选择 `Application Default Credentials`，填写明确的 Google Cloud 项目 ID 和 Location，再拉取模型。`gcloud auth login` 与 ADC 是两套独立凭证，不能替代上述命令。遇到 quota project 提示时执行：
+
+```bash
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+```
+
+同一份 ADC 身份可以配置多个 Vertex 项目实例，前提是该身份在每个项目中都拥有所需的 Vertex AI IAM 权限。切换已有实例到 ADC 并保存后，网关会从本项目配置及生成的 `vertex_sa_*.json` 中移除该实例的旧服务账号私钥。
 
 也可以直接编辑 `providers_config.json`（参考 [`env_demo`](env_demo) 了解可迁移的环境变量），字段结构：
 

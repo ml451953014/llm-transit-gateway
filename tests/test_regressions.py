@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from fastapi import HTTPException
+from google.auth.exceptions import RefreshError
 from starlette.requests import Request
 
 import provider_manager
@@ -165,6 +166,105 @@ class ProviderManagerRegressionTests(unittest.TestCase):
         self.assertEqual(report["sources"][1]["status"], "error")
         self.assertEqual(report["sources"][1]["error"], "HTTP 403")
 
+    def test_vertex_adc_model_report_uses_default_credentials(self):
+        credentials = mock.Mock(token="adc-access-token")
+        empty_response = mock.MagicMock()
+        empty_response.__enter__.return_value.read.return_value = b'{"publisherModels": []}'
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            adc_path = Path(tmp_dir) / "application_default_credentials.json"
+            adc_path.write_text("{}")
+            with (
+                mock.patch(
+                    "provider_manager.gcloud_adc_credentials_path", return_value=adc_path
+                ),
+                mock.patch(
+                    "google.auth.load_credentials_from_file",
+                    return_value=(credentials, "detected-project"),
+                ) as load_credentials,
+                mock.patch(
+                    "provider_manager.urllib.request.urlopen",
+                    side_effect=[empty_response, empty_response],
+                ) as opened,
+            ):
+                report = provider_manager.fetch_vertex_models_report(
+                    "explicit-project", "", "", "global", auth_mode="gcloud_adc"
+                )
+
+        load_credentials.assert_called_once_with(
+            str(adc_path), scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        credentials.refresh.assert_called_once()
+        self.assertEqual(report["models"], [])
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual(
+            opened.call_args_list[0].args[0].headers["Authorization"],
+            "Bearer adc-access-token",
+        )
+
+    def test_vertex_adc_refresh_error_explains_how_to_reauthenticate(self):
+        credentials = mock.Mock()
+        credentials.refresh.side_effect = RefreshError("expired")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            adc_path = Path(tmp_dir) / "application_default_credentials.json"
+            adc_path.write_text("{}")
+            with (
+                mock.patch(
+                    "provider_manager.gcloud_adc_credentials_path", return_value=adc_path
+                ),
+                mock.patch(
+                    "google.auth.load_credentials_from_file",
+                    return_value=(credentials, "demo-project"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "gcloud auth application-default login"
+                ):
+                    provider_manager.fetch_vertex_models_report(
+                        "demo-project", "", "", "global", auth_mode="gcloud_adc"
+                    )
+
+    def test_vertex_adc_yaml_references_gcloud_file_without_copying_service_account(self):
+        config = provider_config(selected_models=[])
+        config["providers"] = [{
+            "id": "vertex_adc",
+            "name": "Vertex ADC",
+            "type": "vertex_ai",
+            "enabled": True,
+            "api_keys": [],
+            "base_url": "",
+            "models": ["gemini-test"],
+            "selected_models": ["gemini-test"],
+            "extra": {
+                "auth_mode": "gcloud_adc",
+                "project": "demo-project",
+                "location": "global",
+            },
+        }]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            old_base = provider_manager.BASE_DIR
+            old_yaml = provider_manager.LITELLM_YAML_PATH
+            provider_manager.BASE_DIR = Path(tmp_dir)
+            provider_manager.LITELLM_YAML_PATH = Path(tmp_dir) / "litellm.yaml"
+            adc_path = Path(tmp_dir) / "gcloud" / "application_default_credentials.json"
+            adc_path.parent.mkdir()
+            adc_path.write_text("{}")
+            try:
+                with mock.patch(
+                    "provider_manager.gcloud_adc_credentials_path", return_value=adc_path
+                ):
+                    rendered = provider_manager.generate_litellm_yaml(config)
+            finally:
+                provider_manager.BASE_DIR = old_base
+                provider_manager.LITELLM_YAML_PATH = old_yaml
+
+            self.assertIn("model: vertex_ai/gemini-test", rendered)
+            self.assertIn("vertex_project: 'demo-project'", rendered)
+            self.assertIn("vertex_location: 'global'", rendered)
+            self.assertIn(f"vertex_credentials: '{adc_path}'", rendered)
+            self.assertFalse((Path(tmp_dir) / "vertex_sa_vertex_adc.json").exists())
+
     def test_config_write_is_private_and_atomic(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             old_path = provider_manager.CONFIG_FILE
@@ -200,6 +300,27 @@ class ProviderManagerRegressionTests(unittest.TestCase):
                 self.assertTrue(keep.exists())
                 self.assertFalse(remove.exists())
                 self.assertTrue(unrelated.exists())
+            finally:
+                provider_manager.BASE_DIR = old_base
+
+    def test_prune_vertex_credentials_removes_file_after_switching_to_adc(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            old_base = provider_manager.BASE_DIR
+            provider_manager.BASE_DIR = Path(tmp_dir)
+            try:
+                stale = Path(tmp_dir) / "vertex_sa_adc.json"
+                stale.write_text("stale-secret")
+                config = provider_config(selected_models=[])
+                config["providers"].append({
+                    "id": "adc", "name": "ADC", "type": "vertex_ai", "enabled": True,
+                    "api_keys": [], "base_url": "", "models": [], "selected_models": [],
+                    "extra": {"auth_mode": "gcloud_adc", "project": "demo-project"},
+                })
+
+                removed = provider_manager.prune_vertex_credential_files(config)
+
+                self.assertEqual(removed, ["vertex_sa_adc.json"])
+                self.assertFalse(stale.exists())
             finally:
                 provider_manager.BASE_DIR = old_base
 
@@ -759,11 +880,21 @@ class WebUiRegressionTests(unittest.TestCase):
             self.assertIn(f"{target_field}: data.{source_field}.trim()", self.html)
         self.assertIn("文件只在浏览器中解析", self.html)
 
+    def test_vertex_adc_is_available_without_storing_private_key(self):
+        self.assertIn("gcloud Application Default Credentials（推荐，不保存私钥）", self.html)
+        self.assertIn("gcloud auth application-default login", self.html)
+        self.assertIn("#vertexDraftServiceAccountPanel[hidden] { display: none !important; }", self.html)
+        self.assertIn("function setVertexAuthMode(idx, mode)", self.html)
+        self.assertIn("delete provider.extra.private_key", self.html)
+        self.assertIn("auth_mode: vertexDraftAuthMode", self.html)
+        self.assertIn("const requiresServiceAccount = vertexDraftAuthMode === 'service_account'", self.html)
+
     def test_vertex_project_can_be_created_as_an_independent_instance(self):
         self.assertIn('id="vertexProviderForm"', self.html)
         self.assertIn("type: 'vertex_ai'", self.html)
         self.assertIn("managed_instance: true", self.html)
-        self.assertIn("一个 JSON 对应一个独立网关实例", self.html)
+        self.assertIn("每个项目作为独立网关实例", self.html)
+        self.assertIn('id="vertexProviderProject"', self.html)
 
     def test_model_source_status_and_duplicate_route_controls_are_visible(self):
         self.assertIn("p.model_sources = data.sources || []", self.html)

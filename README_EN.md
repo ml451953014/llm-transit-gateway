@@ -17,9 +17,9 @@ LLM Transit Gateway is a local-first, multi-provider compatibility gateway. It e
 - **Use Gemini in more AI tools**: expose Gemini API and Vertex AI models through endpoints understood by clients such as cc-switch, Cursor, VS Code extensions, and the OpenAI SDK.
 - **A compatibility layer, not just a proxy**: normalize differences between clients, LiteLLM, and upstream providers, including Gemini thinking parameters, tool calls, structured output, trailing message roles, and unsupported fields.
 - **Gemini thought-signature and long-session compatibility**: remove irrelevant `__thought__` signature suffixes from cross-model history, recursively unwrap LiteLLM `encitem_` IDs, and preserve tool-call references so long Responses API sessions do not fail because of invalid or oversized IDs.
-- **Independent management for multiple Vertex projects**: each service-account JSON file becomes a separate gateway instance with its own credentials, model permissions, routing prefix, and concurrency limit. Duplicate model names can be assigned an explicit default route.
+- **Independent management for multiple Vertex projects**: each Google Cloud project becomes a separate gateway instance using either keyless gcloud ADC or a service-account JSON file, with its own model permissions, routing prefix, and concurrency limit. Duplicate model names can be assigned an explicit default route.
 - **Optimized for long-running agent sessions**: repair malformed tool arguments, rebuild Bedrock `toolConfig`, normalize tool-call IDs, and handle slow streaming headers, real upstream status codes, and mid-stream disconnects.
-- **Visual configuration and troubleshooting**: add, remove, and configure providers from the Web console; import Vertex service-account JSON files, fetch models, test every public endpoint, and inspect live logs.
+- **Visual configuration and troubleshooting**: add, remove, and configure providers from the Web console; choose Vertex ADC or import a service-account JSON file, fetch models, test every public endpoint, and inspect live logs.
 
 ## Architecture
 
@@ -46,10 +46,10 @@ The two gateway layers have separate responsibilities: `proxy.py` handles reques
 
 ## Features
 
-- **Multi-provider aggregation**: Gemini, Vertex AI with service accounts, AWS Bedrock with bearer tokens, OpenAI, direct Anthropic access, and any number of custom OpenAI-compatible services.
+- **Multi-provider aggregation**: Gemini, Vertex AI with ADC or service accounts, AWS Bedrock with bearer tokens, OpenAI, direct Anthropic access, and any number of custom OpenAI-compatible services.
 - **Web management console** at `http://localhost:4000/`:
   - Configure API keys, base URLs, and provider-specific credentials.
-  - Create multiple Vertex AI project instances, each with separate credentials, model sets, and routing prefixes.
+  - Create multiple Vertex AI project instances, each with its own authentication mode, model set, and routing prefix.
   - Fetch provider model lists and choose which models to enable.
   - Configure global and per-provider concurrency limits, retries, retry intervals, and request timeouts.
   - Test all public API endpoints.
@@ -103,7 +103,23 @@ After startup:
 
 Open `http://localhost:4000/`, select a provider, enter its API key or provider-specific credentials, fetch its models, select the models to enable, turn on the provider, and click **Save & Apply**. The gateway regenerates `litellm_config.yaml` and restarts the LiteLLM child process automatically.
 
-To connect multiple Vertex projects, choose **Add Gateway → Google Vertex AI** and import one service-account JSON file for each project. Every instance must have a unique routing prefix, such as `vertex_google/` or `vertex_claude/`. The fetched publisher catalog is a candidate list, not proof that the account can call every model; verify access with the built-in API tests after saving.
+To connect multiple Vertex projects, choose **Add Gateway → Google Vertex AI**, create one instance per project, and select its authentication mode. Every instance must have a unique routing prefix, such as `vertex_google/` or `vertex_claude/`. The fetched publisher catalog is a candidate list, not proof that the account can call every model; verify access with the built-in API tests after saving.
+
+#### Vertex AI with gcloud ADC (recommended)
+
+ADC uses short-lived access tokens, so the gateway does not copy or store a service-account private key. Run this command as the **same operating-system user that runs the gateway**:
+
+```bash
+gcloud auth application-default login
+```
+
+Then select `Application Default Credentials` for the Vertex instance, enter the target Google Cloud project ID and location, and fetch its models. `gcloud auth login` uses separate credentials and does not replace the command above. If Google reports that no quota project is configured, run:
+
+```bash
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+```
+
+One ADC identity can back multiple Vertex project instances when it has the required Vertex AI IAM permissions in every project. After you switch an existing instance to ADC and save, the gateway removes that instance's old service-account private key from both the project configuration and its generated `vertex_sa_*.json` file.
 
 You can also edit `providers_config.json` directly. See [`env_demo`](env_demo) for supported environment-variable migration. The configuration shape is:
 

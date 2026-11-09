@@ -1299,8 +1299,7 @@ _GEMINI_SCHEMA_TOOLS_LIMIT = 80
 
 def _is_gemini_model(model_name: str) -> bool:
     m = (model_name or "").lower()
-    # google/ 前缀是 LiteLLM 中 Gemini API 的正确前缀；gemini/ 前缀走 Vertex AI
-    return "gemini" in m or m.startswith("vertex_ai/") or m.startswith("vertex/") or m.startswith("google/")
+    return "gemini" in m or m.startswith("vertex_ai/") or m.startswith("vertex/")
 
 
 def _fix_gemini_effort(value):
@@ -1834,33 +1833,14 @@ async def proxy(request: Request, path: str):
                             # 429/5xx 属于可重试错误：直接结束流，客户端会自行重发
                             print(f"[{time.strftime('%H:%M:%S')}] [WARN] 上游返回 {resp.status_code}（已开流，结束流让客户端重试）：{model_name}")
                         return
-                    source = resp.aiter_raw()
-                    if _is_gemini_model(model_name):
-                        async def reopen():
-                            # 沿用同一个并发名额：先关掉空的这一条，再发一次
-                            await resp.aclose()
-                            try:
-                                req2 = _stream_http_client.build_request(
-                                    method=request.method, url=upstream, headers=headers,
-                                    content=body, params=request.query_params,
-                                )
-                                r2 = await _stream_http_client.send(req2, stream=True)
-                            except httpx.HTTPError:
-                                return None
-                            if r2.status_code >= 400:
-                                await r2.aclose()
-                                return None
-                            print(f"[{time.strftime('%H:%M:%S')}] [WARN] Gemini 流式返回空响应，已自动重试一次：{model_name}")
-                            return r2
-                        source = empty_guard.guarded_stream(
-                            resp, reopen,
-                            lambda: _save_failed_request(body, model_name, 200, f"Gemini 流式重试后仍为空响应：{model_name}"),
-                        )
+                    watcher = empty_guard.StreamOutputWatcher() if _is_gemini_model(model_name) else None
                     if rewrite_signed_ids:
                         # 先拆合并的工具调用（id 还是原样、带签名），再换短 id
                         splitter = _MergedCallStreamSplitter(model_name)
                         rewriter = _SignedIdStreamRewriter(model_name)
-                        async for chunk in source:
+                        async for chunk in resp.aiter_raw():
+                            if watcher:
+                                watcher.feed(chunk)
                             out = splitter.feed(chunk)
                             out = rewriter.feed(out) if out else b""
                             if out:
@@ -1870,8 +1850,13 @@ async def proxy(request: Request, path: str):
                         if tail:
                             yield tail
                     else:
-                        async for chunk in source:
+                        async for chunk in resp.aiter_raw():
+                            if watcher:
+                                watcher.feed(chunk)
                             yield chunk
+                    if watcher and watcher.is_empty():
+                        # 流已经发给客户端，无法重试；存请求体供排查
+                        _save_failed_request(body, model_name, 200, f"Gemini 流式返回空响应（无正文无工具调用）：{model_name}")
                 except httpx.HTTPError as e:
                     # 上游流中途断开：不让异常冒到 uvicorn 刷整段栈；直接结束流，客户端
                     # （Codex）会把缺少 response.completed 当作可重试错误自行重发。

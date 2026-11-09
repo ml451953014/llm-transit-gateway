@@ -791,7 +791,8 @@ def generate_litellm_yaml(config: Dict[str, Any]) -> str:
                 param_lines = []
 
                 if p_type == "gemini":
-                    param_lines.append(f"      model: gemini/{m}")
+                    # LiteLLM 中 gemini/ 前缀走 Vertex AI，google/ 前缀才走 Gemini API
+                    param_lines.append(f"      model: google/{m}")
                     param_lines.append(f"      api_key: '{key}'")
 
                 elif p_type == "openai":
